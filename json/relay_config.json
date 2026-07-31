@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-06-30T15:42:22",
+  "speed_at_calibration": 6,
+  "remove": {
+    "angle": 67.5
+  },
+  "transport": {
+    "angle": 114.5
+  }
+}

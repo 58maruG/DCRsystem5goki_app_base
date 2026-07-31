@@ -1,0 +1,31 @@
+{
+    "_comment": "base方式（緩いHSV＋虚像除去＋果柄除去）。raw の現行値へ戻す場合は DCRsystem5goki_PC_app_raw/json/ の同名ファイルで上書きする。",
+    "lower1": [
+        0,
+        30,
+        30
+    ],
+    "upper1": [
+        30,
+        255,
+        255
+    ],
+    "lower2": [
+        160,
+        30,
+        30
+    ],
+    "upper2": [
+        180,
+        255,
+        255
+    ],
+    "reflect_sat_lo": 0,
+    "reflect_sat_hi": 75,
+    "reflect_v_lo": 220,
+    "reflect_v_hi": 255,
+    "stem_open": 20,
+    "roi_width_at_tuning": 640,
+    "min_blob_area": 25000,
+    "fruit_speed_px": 70
+}

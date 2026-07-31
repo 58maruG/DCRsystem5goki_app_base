@@ -1,0 +1,41 @@
+[project]
+name = "dcrsystem5goki-pc-app-base"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "duckdb>=1.5.4",
+    "hidapi>=0.15.0",
+    # ByteTrack が使う線形割当。明示しないと ultralytics が起動時に
+    #   check_requirements で自動 pip install を試み、オフラインだと失敗する。
+    "lap>=0.5.13",
+    "numpy>=2.2.6,<2.3",  # 2.3以降はPython>=3.12必須のためPython3.10(JetPack6)では使えない
+    "onnx>=1.22.0",
+    "onnxruntime-gpu>=1.23.2,<1.24",  # 1.24以降はcp310のwheelが提供されずPython3.10では使えない
+    "onnxslim>=0.1.94",
+    "opencv-python>=4.13.0.92",
+    "pypylon>=26.5.0",
+    "pyserial>=3.5",
+    "pyside6>=6.11.1",
+    "serial>=0.0.97",
+    "tensorrt>=11.1.0.106",
+    "torch==2.12.1",
+    "torchvision==0.27.1",
+    "ultralytics>=8.4.80",
+]
+
+# torch/torchvision は CUDA ビルドを明示的に指定する。
+#   PyPI の既定は CPU 専用ビルド（torch 2.12.1+cpu）で、これが入ると YOLO 推論が
+#   GPU ではなく CPU で走り、1枚あたり 7.9ms → 62ms へ約8倍遅くなる。
+#   実際に 2026-06-27 の環境再作成でこれが起き、06-30〜07-08 のログの推論 67ms は
+#   その状態のもの（GPU クロック低下が原因ではない）。
+#   uv sync で CPU ビルドへ戻らないよう、ここでインデックスを固定しておく。
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }

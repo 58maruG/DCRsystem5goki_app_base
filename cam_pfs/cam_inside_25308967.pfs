@@ -1,0 +1,93 @@
+# {05D8C294-F295-4dfb-9D01-096BD04049F4}
+# GenApi persistence file (version 3.5.0)
+# Device = Basler::UsbCameraParams -- Basler USB3Vision camera interface -- Device version = 1.0.0 -- Product GUID = 71351C50-4DDC-4D3B-BDF7-0D1539FEFD30 -- Product version GUID = FC0336C9-679E-437C-B17C-BCC6AD6D6677
+GainRaw	{GainSelector=All}	32
+GainSelector	All
+GainAuto	{GainSelector=All}	Off
+GainSelector	All
+AutoGainLowerLimitRaw	{GainSelector=All}	32
+GainSelector	All
+AutoGainUpperLimitRaw	{GainSelector=All}	255
+GainSelector	All
+BlackLevelRaw	{BlackLevelSelector=All}	0
+BlackLevelSelector	All
+GammaRaw	1000
+BslColorSpaceMode	sRGB
+Width	560
+Height	560
+OffsetX	342
+OffsetY	164
+BinningHorizontalMode	Average
+BinningHorizontal	1
+BinningVerticalMode	Average
+BinningVertical	1
+ReverseX	0
+ReverseY	1
+PixelFormat	RGB8
+TestPattern	Off
+SensorShutterMode	Global
+OverlapMode	On
+BslImmediateTriggerMode	Off
+ExposureTimeRaw	604
+ExposureAuto	Off
+AutoExposureTimeLowerLimitRaw	10
+AutoExposureTimeUpperLimitRaw	1000000
+TriggerMode	{TriggerSelector=FrameStart}	Off
+TriggerSelector	FrameStart
+TriggerSource	{TriggerSelector=FrameStart}	Line1
+TriggerSelector	FrameStart
+TriggerActivation	{TriggerSelector=FrameStart}	RisingEdge
+TriggerSelector	FrameStart
+ExposureMode	Timed
+AcquisitionFramePeriodRaw	50000
+LightSourcePreset	Off
+BalanceRatioRaw	{BalanceRatioSelector=Red}	99
+BalanceRatioRaw	{BalanceRatioSelector=Green}	72
+BalanceRatioRaw	{BalanceRatioSelector=Blue}	115
+BalanceRatioSelector	Red
+BalanceWhiteAuto	Off
+BslHueValue	0
+BslSaturationValueRaw	2175
+ContrastEnhancementRaw	0
+BslContrastMode	Linear
+BslBrightnessRaw	0
+BslContrastRaw	1
+PgiMode	Off
+DefectPixelCorrectionMode	Off
+LineMode	{LineSelector=Line1}	Input
+LineMode	{LineSelector=Line2}	Input
+LineSelector	Line1
+LineInverter	{LineSelector=Line1}	0
+LineInverter	{LineSelector=Line2}	0
+LineSelector	Line1
+LineSource	{LineSelector=Line1}	UserOutput1
+LineSource	{LineSelector=Line2}	UserOutput2
+LineSelector	Line1
+LineDebouncerTimeRaw	{LineSelector=Line1}	0
+LineDebouncerTimeRaw	{LineSelector=Line2}	0
+LineSelector	Line1
+UserOutputValue	{UserOutputSelector=UserOutput1}	0
+UserOutputValue	{UserOutputSelector=UserOutput2}	0
+UserOutputSelector	UserOutput1
+AutoTargetBrightnessRaw	30
+AutoTargetBrightnessDampingRaw	5
+AutoBacklightCompensationRaw	0
+AutoFunctionProfile	Smart
+AutoFunctionROIWidth	{AutoFunctionROISelector=ROI1}	1280
+AutoFunctionROIWidth	{AutoFunctionROISelector=ROI2}	480
+AutoFunctionROISelector	ROI1
+AutoFunctionROIHeight	{AutoFunctionROISelector=ROI1}	960
+AutoFunctionROIHeight	{AutoFunctionROISelector=ROI2}	960
+AutoFunctionROISelector	ROI1
+AutoFunctionROIOffsetX	{AutoFunctionROISelector=ROI1}	0
+AutoFunctionROIOffsetX	{AutoFunctionROISelector=ROI2}	8
+AutoFunctionROISelector	ROI1
+AutoFunctionROIOffsetY	{AutoFunctionROISelector=ROI1}	0
+AutoFunctionROIOffsetY	{AutoFunctionROISelector=ROI2}	0
+AutoFunctionROISelector	ROI1
+DeviceLinkThroughputLimitMode	{DeviceLinkSelector=0}	On
+DeviceLinkSelector	0
+DeviceLinkThroughputLimit	{DeviceLinkSelector=0}	80000000
+DeviceLinkThroughputLimit	{DeviceLinkSelector=1}	0
+DeviceLinkSelector	0
+DeviceIndicatorMode	Active

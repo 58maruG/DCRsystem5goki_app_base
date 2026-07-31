@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.claude/
+
+# Virtual environments
+.venv
+# requirements files
+
+# Folder
+bench/
+analysis/
+benio_analysis/
+evaluated_images/
+training_images/
+Trained_Models/
+
+# config files
+json/hsv_config.json
+
+# Python files
+standalone/hsv_test.py
+standalone/hsv_calibration_static.py
