@@ -1,6 +1,6 @@
 """HSVマスク生成・整形の共通処理。
 
-本番の果実検出（module_yolo_csv4_v3.ImageProcessor.get_target_info）と、
+本番の果実検出（module_yolo.ImageProcessor.get_target_info）と、
 閾値調整ツール（standalone/hsv_calibration.py）が同一の実装を使うための共有モジュール。
 両者が同じマスクを作ることが、校正ツールで合わせた閾値をそのまま本番へ持ち込める前提になっている。
 

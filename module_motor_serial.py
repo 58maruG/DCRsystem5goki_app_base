@@ -132,6 +132,16 @@ class MotorSerial:
                 return
         log.warning("READY応答がありません(処理は継続します)。")
 
+    # --- 非同期通知コールバックの呼び出し (内部用) ---
+    #   コールバック内の例外を1つ握りつぶすだけで受信スレッド全体を落とさないための共通処理。
+    def _dispatch_callback(self, callback, label: str) -> None:
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as e:
+            log.error("%sコールバック例外: %s", label, e)
+
     # --- 受信スレッド本体 (Arduinoからの行を常時読み続ける) ---
     #   コマンド応答(OK:.. / ERR:..)はログ表示のみ。
     #   非同期通知(ESTOP / ESTOP_CLEARED)はコールバックへ渡す。
@@ -153,32 +163,16 @@ class MotorSerial:
 
             if line == "ESTOP":
                 log.debug("[Serial Recv] ESTOP (非常停止 作動)")
-                if self.on_estop:
-                    try:
-                        self.on_estop()
-                    except Exception as e:
-                        log.error("on_estopコールバック例外: %s", e)
+                self._dispatch_callback(self.on_estop, "on_estop")
             elif line == "ESTOP_CLEARED":
                 log.debug("[Serial Recv] ESTOP_CLEARED (非常停止 解除)")
-                if self.on_estop_cleared:
-                    try:
-                        self.on_estop_cleared()
-                    except Exception as e:
-                        log.error("on_estop_clearedコールバック例外: %s", e)
+                self._dispatch_callback(self.on_estop_cleared, "on_estop_cleared")
             elif line == "STANDALONE":
                 log.debug("[Serial Recv] STANDALONE (単体モード 移行)")
-                if self.on_standalone:
-                    try:
-                        self.on_standalone()
-                    except Exception as e:
-                        log.error("on_standaloneコールバック例外: %s", e)
+                self._dispatch_callback(self.on_standalone, "on_standalone")
             elif line == "PC_MODE":
                 log.debug("[Serial Recv] PC_MODE (PC連携モード 復帰)")
-                if self.on_pc_mode:
-                    try:
-                        self.on_pc_mode()
-                    except Exception as e:
-                        log.error("on_pc_modeコールバック例外: %s", e)
+                self._dispatch_callback(self.on_pc_mode, "on_pc_mode")
             elif line == "OK:PONG":
                 t_recv     = time.time()
                 latency_ms = None

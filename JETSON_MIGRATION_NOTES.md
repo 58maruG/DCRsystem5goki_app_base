@@ -87,12 +87,12 @@
 
 ただし移動前の本メモには「`main_5goki_JP_v3.py` から一切 import されていない」と
 記載していたが、これは**誤解を招く記述だった**。main から直接 import されていないだけで、
-`module_yolo_csv4_v3.py` を経由して `ripeness_classifier.common.mask_utils` に
+`module_yolo.py` を経由して `ripeness_classifier.common.mask_utils` に
 **推移的に依存**していた（果実検出1段目のHSVマスク生成＝ホットパス）。
 
 分離にあたり、本番が使う3関数（`mask_from_hsv` / `remove_stem` /
 `remove_reflection_sat`）はプロジェクト直下の `hsv_mask_utils.py` へ移した。
-`module_yolo_csv4_v3.py` と `standalone/hsv_calibration.py` が同ファイルを共有する。
+`module_yolo.py` と `standalone/hsv_calibration.py` が同ファイルを共有する。
 移動先の `ripeness_classifier/common/mask_utils.py` にも同一実装が残っているため、
 マスク生成アルゴリズムを変更する際は両方を揃えること（閾値はJSON側なので影響しない）。
 
@@ -105,8 +105,8 @@
 | 発生元 | 数 | 内容 |
 |---|---|---|
 | メインスレッド | 1 | Qtイベントループ |
-| `module_cameras_5goki_v2.py:119` | **4** | カメラ別キャプチャ（`_capture_loop`） |
-| `module_yolo_csv4_v3.py:388` | 1 | YOLO推論ワーカー（4カメラ共有・キュー経由） |
+| `module_cameras_5goki.py:119` | **4** | カメラ別キャプチャ（`_capture_loop`） |
+| `module_yolo.py:388` | 1 | YOLO推論ワーカー（4カメラ共有・キュー経由） |
 | `module_motor_serial.py:106` | 1 | Arduino受信（`_reader_loop`） |
 | `module_motor_serial.py:112` | 1 | Arduinoハートビート |
 | `dcr_logger.py:150` | 1 | ログ書き込み（`dcr-logger`） |
@@ -165,7 +165,7 @@ baseline                : 17.6 MB
 
 ### 4.2 カメラ関連メモリ **[計算]**
 
-pfsの実解像度と `MaxNumBuffer=20`（`module_cameras_5goki_v2.py:92`）から算出。
+pfsの実解像度と `MaxNumBuffer=20`（`module_cameras_5goki.py:92`）から算出。
 
 Pylon内部バッファ:
 
@@ -222,7 +222,7 @@ cam_outside 500×500×3 × 20fps = 15.00 MB/s
 合計                          = 82.97 MB/s
 ```
 
-`module_cameras_5goki_v2.py:94` のコメントは「4台で400MB/s = USB3.0の実効限界付近」
+`module_cameras_5goki.py:94` のコメントは「4台で400MB/s = USB3.0の実効限界付近」
 としているが、**実際は約83MB/s** で桁が違う。Jetsonの共有USBコントローラでも
 問題になりにくい。
 
@@ -319,7 +319,7 @@ PySide6       : +16.7 MB
 ### 8.1 前提: スレッドは増えない
 
 「HSVを4スレッドに分ける」提案は、**新規スレッドの追加ではなく、
-`module_cameras_5goki_v2.py:119` に既に存在する4本のキャプチャスレッドへ
+`module_cameras_5goki.py:119` に既に存在する4本のキャプチャスレッドへ
 GUIスレッドの仕事を移す**もの。スレッド総数は10本のまま。
 
 ### 8.2 GILは障害にならない **[実測]**
@@ -398,7 +398,7 @@ GUIの `cv2.resize` にも影響するが §6.3 の通り実測上ほぼ無害�
 | 4 | Qt表示を `cv2.resize` → QImage化 | 5.3→2.4 ms | ほぼ無し |
 | 5 | 画像収集の停止 | コピー2.4MB/フレーム削減 | §10.2 参照 |
 | 6 | `np.array`/`getStructuringElement` 事前生成、morph反復2→1 | 17.8→16.1 ms | 反復削減はマスク品質に影響 |
-| 7 | `module_yolo_csv4_v3.py:780` の `.copy()` 削除 | 1.2MB/フレーム削減 | 無し（下記） |
+| 7 | `module_yolo.py:780` の `.copy()` 削除 | 1.2MB/フレーム削減 | 無し（下記） |
 
 ### 10.1 #2 実装時の制約
 
@@ -418,7 +418,7 @@ GUIの `cv2.resize` にも影響するが §6.3 の通り実測上ほぼ無害�
 
 ### 10.2 #5 の背景
 
-`module_yolo_csv4_v3.py:212` と `:251` を見ると `cv2.imwrite` は既にコメントアウトされ、
+`module_yolo.py:212` と `:251` を見ると `cv2.imwrite` は既にコメントアウトされ、
 **画像保存は停止中**。ところが供給側は全速力で動いており:
 
 - `_update_cam_tile` の `frame.copy()`（1.2MB）
@@ -429,7 +429,7 @@ GUIの `cv2.resize` にも影響するが §6.3 の通り実測上ほぼ無害�
 
 ### 10.3 #7 の根拠
 
-`module_yolo_csv4_v3.py:764` で `input_img_resized = cv2.resize(...)` が
+`module_yolo.py:764` で `input_img_resized = cv2.resize(...)` が
 新規配列を返しており、`:780` の `.copy()` は冗長。ローカル変数で毎回作り直されるため
 他から変更される恐れがない。
 
@@ -442,7 +442,7 @@ GUIの `cv2.resize` にも影響するが §6.3 の通り実測上ほぼ無害�
 | 1 | `telemetry_sources.py:10` `gpu_stats()` | `pynvml`(NVML)前提。**JetsonのGPUはNVMLで見えない** | `jtop`(jetson-stats) か `tegrastats` へ差し替え。放置すると `gpu_temp`/`gpu_util`/`gpu_power` が常に空 |
 | 2 | `module_motor_serial.py:84` `_detect_port()` | Windowsの `COM3` 系を前提 | Linuxの `/dev/ttyACM*` `/dev/ttyUSB*` に対応させる |
 | 3 | ~~`pyproject.toml:6`~~ | ~~`requires-python = ">=3.12"`~~ | **2026-07-22 対応済み [実測]**。`requires-python = ">=3.10,<3.11"` へ変更し `uv sync` で本PCのvenvもPython 3.10.19へ切替済み（§14.10参照） |
-| 4 | `module_cameras_5goki_v2.py:97` → `:99-104` | コードで `DeviceLinkThroughputLimit=100MB/s` を設定した**直後**に `load_pfs_custom()` がpfsを読み込み上書き。pfs側は163MB/s、`cam_inside` に至っては制限モード自体がOff → **コードの意図した制限が無効化されている** | 実害は小さい（実必要帯域83MB/s）が、意図と実態の食い違いは移行前に解消すべき |
+| 4 | `module_cameras_5goki.py:97` → `:99-104` | コードで `DeviceLinkThroughputLimit=100MB/s` を設定した**直後**に `load_pfs_custom()` がpfsを読み込み上書き。pfs側は163MB/s、`cam_inside` に至っては制限モード自体がOff → **コードの意図した制限が無効化されている** | 実害は小さい（実必要帯域83MB/s）が、意図と実態の食い違いは移行前に解消すべき |
 | 5 | 依存パッケージ全般 | JetPackのバージョンに固定されたNVIDIA提供ARM64版 torch / TensorRT を使う必要がある | ultralytics のバージョンとの組合せ検証。Jetson用ビルドは本家より更新が遅れがち |
 | 6 | pypylon | ARM64 Linux版の対応確認が必要 | Basler公式の対応状況を要確認 |
 
@@ -460,7 +460,7 @@ GUIの `cv2.resize` にも影響するが §6.3 の通り実測上ほぼ無害�
 
 2. **4カメラ同時USB3グラブの安定性**
    キャリアボードのUSB3ホストコントローラが独立か共有か。実機で4台同時グラブして
-   ドロップ率を確認（`module_cameras_5goki_v2.py` の `[CamStats]` ログで追える）
+   ドロップ率を確認（`module_cameras_5goki.py` の `[CamStats]` ログで追える）
 
 3. **6コアでのスレッド競合**
    `bench/bench_oversub.py` をJetson実機で実行し、§8.3 の表を実測値で埋める
@@ -528,7 +528,7 @@ ultralytics import前: cv2.getNumThreads() = 32（論理コア数）
 ultralytics import後: cv2.getNumThreads() = 1
 ```
 
-つまり `module_yolo_csv4_v3.py` が `ultralytics` を import する現行コードでは、
+つまり `module_yolo.py` が `ultralytics` を import する現行コードでは、
 **§9で提案している `cv2.setNumThreads(1)` は実質的に import 時点で既に効いている**
 可能性が高い（明示的に呼んでいなくても）。とはいえ ultralytics のバージョンに
 依存する非公式の副作用であり、将来のバージョンアップで挙動が変わり得るため、
@@ -681,7 +681,7 @@ CPU側のホットパス最適化に関する結論（§9・§10の改善案の�
 python bench/bench_gpu_infer.py
 ```
 
-現状実装（`module_yolo_csv4_v3.py:785`）と同じ「1枚ずつ `model.predict`」呼び出しと、
+現状実装（`module_yolo.py:785`）と同じ「1枚ずつ `model.predict`」呼び出しと、
 §10.1で提案されているバッチ推論（4枚まとめて1回の`predict`）を比較:
 
 | 構成 | 1枚あたり(中央値) | 4枚分のコスト | スループット |
@@ -785,9 +785,9 @@ Python 3.12環境へロールバック可能）。
 （`tensorrt-cu13-bindings` は事前に `cp310` wheelの存在をPyPIで確認済み）。
 
 **動作確認**（Python 3.10.19のvenv上）:
-- `module_cameras_5goki_v2.py` / `module_motor_serial.py` / `module_relay.py` /
+- `module_cameras_5goki.py` / `module_motor_serial.py` / `module_relay.py` /
   `module_patlite.py` / `telemetry_sources.py` / `dcr_logger.py` /
-  `module_yolo_csv4_v3.py` の import が全て成功
+  `module_yolo.py` の import が全て成功
 - `torch.cuda.is_available() == True`（CUDA版torchが維持されている。
   `pyproject.toml`内のコメントで警告されているCPU版への意図しない後退は
   起きていない）
@@ -813,9 +813,9 @@ Python 3.12環境へロールバック可能）。
 |---|---|---|
 | §4.3 | 総計 2.3〜3.2 GB（ライブラリ 234 MB 前提） | **プロセス RSS 実測 1965 MB**。総計は 4.0〜4.7 GB へ上方修正。8 GB には収まるが余裕は 3.3〜4.0 GB |
 | §5 | USB 帯域 83 MB/s [計算] | **4台 20.0 fps・エラー 0・ドロップ 0 で 300 秒連続稼働**。実稼働で裏付け |
-| §3・§6・§8・§10-2 | 「HSVはGUIスレッドの50ms QTimer(`update_video_feeds`)が抱える」 | **前提が誤り。既に解消済み**。`module_yolo_csv4_v3.py:848` `_camera_worker` がカメラごとに1本立ち、HSV→前処理→推論→後処理→描画までワーカーで実行して `frame_ready` でGUIへ渡す。GUIスレッドに残るのは QImage 化と `setPixmap` のみ（4台で3.16 ms）。**§10-2 の改善案は実装済み**。なお `module_main_window_JP_v3.py:384` の `QTimer` は `timeout` 未接続の死んだコード |
+| §3・§6・§8・§10-2 | 「HSVはGUIスレッドの50ms QTimer(`update_video_feeds`)が抱える」 | **前提が誤り。既に解消済み**。`module_yolo.py:848` `_camera_worker` がカメラごとに1本立ち、HSV→前処理→推論→後処理→描画までワーカーで実行して `frame_ready` でGUIへ渡す。GUIスレッドに残るのは QImage 化と `setPixmap` のみ（4台で3.16 ms）。**§10-2 の改善案は実装済み**。なお `module_main_window_JP.py:384` の `QTimer` は `timeout` 未接続の死んだコード |
 | §6.2 | GUIスレッド 26 ms / 50 ms 予算 | 締切の正体は GUI ではなく**カメラのフレーム周期（FPS=20 → 50 ms）**。カメラ別ワーカー1本が1フレームを50 ms以内に処理する必要がある。**帯内フレームは実測 44.42 ms = 予算の 89 %**（HSV 6.24 / 前処理 0.62 / 推論 36.08 / 後処理 1.48）。締切超過はクラッシュせず「推論枚数が減る」形で現れる（`get_next_frame` が最新フレームのみ返すため） |
-| §10 の優先順位 | HSV最適化（#2 #3）が最優先 | **組み替えが必要**。帯内フレームのうち HSV は 6.24 ms（14 %）で、推論まわりが 38.2 ms（86 %）。加えて `module_yolo_csv4_v3.py:944` の `_infer_lock` が4カメラの推論を直列化しており、システム全体の推論能力は 27.7 回/秒に制限されている |
+| §10 の優先順位 | HSV最適化（#2 #3）が最優先 | **組み替えが必要**。帯内フレームのうち HSV は 6.24 ms（14 %）で、推論まわりが 38.2 ms（86 %）。加えて `module_yolo.py:944` の `_infer_lock` が4カメラの推論を直列化しており、システム全体の推論能力は 27.7 回/秒に制限されている |
 | §12-1 | TensorRT 化が最大の未確定要素 | **優先度が下がった**。GPU 使用率は実稼働で 11.5 %（最大 37 %）・40 W・55 ℃ しかなく、FP32 のままで GPU は律速していない |
 | §14.8 | 純GPU推論 8.4〜8.7 ms/枚 | **実アプリの `infer_latency` は 36.08 ms/回**。差の 27.7 ms（77 %）は Python/ultralytics 側のオーバーヘッドで、**TensorRT では消えない**。§10 に「推論呼び出しのPython側オーバーヘッド削減」を追加すべき |
 | §14.10 | Python 3.10 への切替は「動作確認済み」 | **要検証**。同一モデル・同一GPUで `infer_latency` が 06-23 の 14.52 ms → 07-22 は 36.08 ms（**2.5倍**）に悪化している。Python 3.10 化 / tensorrt等の追加 / 検出数の増加（4.6→12.5個）のどれが効いているか未切り分け。Jetson へ移す前に決着させること |
@@ -837,15 +837,15 @@ GUIスレッドではなく**カメラ別ワーカーの推論パス**である�
 
 | 内容 | ファイル:行 |
 |---|---|
-| カメラキャプチャスレッド | `module_cameras_5goki_v2.py:119` |
-| カメラのFPS定数 / MaxNumBuffer | `module_cameras_5goki_v2.py:22` / `:92` |
-| 帯域制限の設定（pfsに上書きされる） | `module_cameras_5goki_v2.py:94-104` |
-| 遅延キューの実装 | `module_cameras_5goki_v2.py:164-174` |
-| YOLO推論ワーカー | `module_yolo_csv4_v3.py:388` |
-| HSV判定 `get_target_info` | `module_yolo_csv4_v3.py:259` |
-| 推論結果の適用（単一スレッド必須） | `module_yolo_csv4_v3.py:624` |
-| ホットパス `evaluate_frame` | `module_yolo_csv4_v3.py:699` |
-| 画像保存（コメントアウト中） | `module_yolo_csv4_v3.py:212` / `:251` |
+| カメラキャプチャスレッド | `module_cameras_5goki.py:119` |
+| カメラのFPS定数 / MaxNumBuffer | `module_cameras_5goki.py:22` / `:92` |
+| 帯域制限の設定（pfsに上書きされる） | `module_cameras_5goki.py:94-104` |
+| 遅延キューの実装 | `module_cameras_5goki.py:164-174` |
+| YOLO推論ワーカー | `module_yolo.py:388` |
+| HSV判定 `get_target_info` | `module_yolo.py:259` |
+| 推論結果の適用（単一スレッド必須） | `module_yolo.py:624` |
+| ホットパス `evaluate_frame` | `module_yolo.py:699` |
+| 画像保存（コメントアウト中） | `module_yolo.py:212` / `:251` |
 | GUI更新ループ | `main_5goki_JP_v3.py:415` |
 | QThreadPool | `main_5goki_JP_v3.py:249` |
 | ヘルスログ（バックグラウンド実行） | `main_5goki_JP_v3.py:485` |

@@ -42,8 +42,8 @@ from PySide6.QtGui import QImage, QPixmap
 # 本番と同じモジュール群（定数も流用して齟齬を防ぐ）
 import module_relay as r_ctr
 import module_motor_serial as motor_ctr
-import module_cameras_5goki_v2 as cam_ctr
-import module_yolo_csv4_v3 as yolo_ctr
+import module_cameras_5goki as cam_ctr
+import module_yolo as yolo_ctr
 
 # Arduino のシリアルポート。None で自動検出。うまくいかない場合は "COM3" 等を直接指定する
 SERIAL_PORT = None
@@ -148,7 +148,7 @@ class CalibrationWindow(QMainWindow):
         sp_box.addStretch(1)
         panel.addLayout(sp_box)
 
-        # 保存済みの角度を初期値にする（無ければ module_relay の既定角度）。0.5°単位に変換。
+        # relay_config.json に保存済みの角度を初期値にする。0.5°単位に変換。
         cal = r_ctr.load_relay_calibration()
         init_remove    = int(round(cal["remove"]["angle"] * ANGLE_UNIT))
         init_transport = int(round(cal["transport"]["angle"] * ANGLE_UNIT))
@@ -271,7 +271,7 @@ class CalibrationWindow(QMainWindow):
     def _on_frame_ready(self, cam_name, rgb_image):
         """frame_ready: ワーカーが作った表示用フレーム（RGB・640角・帯線描画済み）を表示する。
         cvtColor・帯線描画はワーカー側で済んでいるので、ここは QImage 化と setPixmap のみ
-        （module_main_window_JP_v3.MainWindow._on_frame_ready と同じ処理）。"""
+        （module_main_window_JP.MainWindow._on_frame_ready と同じ処理）。"""
         lbl = self.cam_labels.get(cam_name)
         if lbl is None:
             return

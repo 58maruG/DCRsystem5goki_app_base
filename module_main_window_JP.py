@@ -1,5 +1,5 @@
 # -------------------------------------------------
-# module_main_window_JP_v3.py
+# module_main_window_JP.py
 #   main.py から分離したウィンドウ／制御ロジック一式。
 #   main側は「起動するだけ」にするため、GUIクラス・バックグラウンド処理・
 #   イベントハンドラはすべてこちらに置く。中身は分離前の main_5goki_JP_v3.py と同一。
@@ -22,13 +22,13 @@ from dcr_logger import DCRLogger, Telemetry
 import telemetry_sources
 
 # GUIモジュール
-import module_gui_JP_v3
+import module_gui_JP
 
 # 制御モジュール
-import module_cameras_5goki_v2 as cam_ctr
+import module_cameras_5goki as cam_ctr
 import module_relay as r_ctr
 import module_patlite as p_ctr
-import module_yolo_csv4_v3 as yolo_ctr
+import module_yolo as yolo_ctr
 import module_motor_serial as motor_ctr
 
 # Arduinoのシリアルポート。None で自動検出。うまくいかない場合は "COM3" 等を直接指定する
@@ -43,7 +43,7 @@ def _chip_colors(bg_hex: str):
 
 # 色付きチップ＋信頼度を1つ組み立てる（内側テーブル）。conf_color で信頼度の文字色を指定。
 def _chip_inner_html(label: str, conf: float, conf_color: str) -> str:
-    info = module_gui_JP_v3.CLASS_DISPLAY.get(label, {"jp": str(label), "color": "#CCCCCC"})
+    info = module_gui_JP.CLASS_DISPLAY.get(label, {"jp": str(label), "color": "#CCCCCC"})
     bg   = info["color"]
     pct  = int(round(conf * 100))
     text_color, border = _chip_colors(bg)
@@ -60,7 +60,7 @@ def _chip_inner_html(label: str, conf: float, conf_color: str) -> str:
 # 確定クラス用チップ（クラス名の矩形の外・左に◎マーク＋信頼度）。
 #   カメラ列で確定クラスを検出したセルに使う。◎は枠外に独立配置する。
 def _chip_confirmed_html(label: str, conf: float) -> str:
-    info = module_gui_JP_v3.CLASS_DISPLAY.get(label, {"jp": str(label), "color": "#CCCCCC"})
+    info = module_gui_JP.CLASS_DISPLAY.get(label, {"jp": str(label), "color": "#CCCCCC"})
     bg   = info["color"]
     pct  = int(round(conf * 100))
     text_color, border = _chip_colors(bg)
@@ -113,7 +113,7 @@ class MotorSignals(QObject):
 # ==========================================================
 # スタートアップウィンドウ
 # ==========================================================
-class StartupWindow(module_gui_JP_v3.StartupWindowUI):
+class StartupWindow(module_gui_JP.StartupWindowUI):
     def __init__(self):
         super().__init__()
         self.button_start.clicked.connect(self.launch_main)
@@ -126,7 +126,7 @@ class StartupWindow(module_gui_JP_v3.StartupWindowUI):
 # ==========================================================
 # サブウィンドウ
 # ==========================================================
-class SubWindow(module_gui_JP_v3.SubWindowUI):
+class SubWindow(module_gui_JP.SubWindowUI):
     def __init__(self, parent_window, initial_speed):
         super().__init__()
         self.button_up_speed.clicked.connect(self.on_up_speed)
@@ -172,7 +172,7 @@ class SubWindow(module_gui_JP_v3.SubWindowUI):
 # ==========================================================
 # カメラエラーウィンドウ
 # ==========================================================
-class CameraErrorWindow(module_gui_JP_v3.CameraErrorWindowUI):
+class CameraErrorWindow(module_gui_JP.CameraErrorWindowUI):
     # 復旧処理（ブロッキング）の完了をGUIスレッドへ返すシグナル。
     #   別スレッドの worker から emit し、GUIスレッドのスロットで後処理する。
     #   ok=成否 / info=失敗時に表示するメッセージ（成功時は None）。
@@ -266,11 +266,23 @@ class CameraErrorWindow(module_gui_JP_v3.CameraErrorWindowUI):
 # ==========================================================
 # メインウィンドウ
 # ==========================================================
-class MainWindow(module_gui_JP_v3.MainWindowUI):
+class MainWindow(module_gui_JP.MainWindowUI):
     def __init__(self):
         super().__init__()
         self.thread_pool = QThreadPool()
 
+        self._init_logging()
+        self._init_operation_lock_flags()
+        self._init_devices()
+        self._init_yolo_detector()
+        self._start_capture()
+        self._wire_detector_signals()
+        self._wire_gui_events()
+        self._init_timers()
+        self._init_startup_display()
+
+    # --- データログ・テレメトリキャッシュの初期化 ---
+    def _init_logging(self):
         # データログ開始（書き込みスレッドのみ先に起動。startup イベントは
         #   モデルの精度などが揃う YOLO 初期化後に記録する）
         self.dcr = DCRLogger(base_dir="logs", line="5goki")
@@ -283,6 +295,20 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         self.history_data = []
         self.current_id = 1
 
+    # --- 操作系ロックの要因フラグ（非常停止・単体モード・カメラエラー）初期化 ---
+    def _init_operation_lock_flags(self):
+        # どちらかが立っていれば運転トグル・設定ボタンを無効化する。
+        self._estop_active = False
+        self._standalone_active = False
+        # カメラエラー中フラグ。True の間はパトライトとGUIステータスをerrorで固定する。
+        self._error_active = False
+        # エラーを起こしたカメラ名。単体モード中に発生した場合はPC復帰時に使用。
+        self._error_cam_name = None
+        # カメラエラー処理済みフラグ（複数台が同時に切断した場合の重複処理防止）
+        self._camera_error_handled = False
+
+    # --- デバイス接続（パトライト・リレー・Arduino・カメラ）---
+    def _init_devices(self):
         # --- デバイス接続 (接続中はYELLOW) ---
         self.patlite = p_ctr.PatliteController()
         if not self.patlite.init():
@@ -299,17 +325,6 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
         # Arduino(ターンテーブル)接続。失敗してもGUIは起動を続ける
         #   非常停止通知はシグナル経由でGUIスレッドへ渡す
-        # 操作系ロックの要因フラグ（非常停止・単体モード）。
-        #   どちらかが立っていれば運転トグル・設定ボタンを無効化する。
-        self._estop_active = False
-        self._standalone_active = False
-        # カメラエラー中フラグ。True の間はパトライトとGUIステータスをerrorで固定する。
-        self._error_active = False
-        # エラーを起こしたカメラ名。単体モード中に発生した場合はPC復帰時に使用。
-        self._error_cam_name = None
-        # カメラエラー処理済みフラグ（複数台が同時に切断した場合の重複処理防止）
-        self._camera_error_handled = False
-
         self.motor_signals = MotorSignals()
         self.motor_signals.estop.connect(self.handle_estop)
         self.motor_signals.estop_cleared.connect(self.handle_estop_cleared)
@@ -343,6 +358,8 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         }
         self.update_stats_display()
 
+    # --- YOLO検出器の初期化とstartupイベント記録 ---
+    def _init_yolo_detector(self):
         # YOLO初期化（モデルパスは module_yolo_csv3.py の MODEL_PATH で一元管理）
         #   dcr を渡し、detections ログを新ロガーへ一本化する
         self.detector = yolo_ctr.YoloDetector(dcr=self.dcr, cameras=self.cameras.controllers)
@@ -359,12 +376,16 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         # メモリリーク局所化のための tracemalloc 定期スナップショット（約60秒ごと）
         self.dcr.start_mem_snapshot(60.0)
 
+    # --- 初期スピード・カメラ表示遅延の適用とキャプチャ開始 ---
+    def _start_capture(self):
         # スピード初期値設定とカメラ遅延の初期適用
         self.saved_speed = 6  # デフォルト速度
         self.update_camera_delays()
 
         self.cameras.start_all_get_frame()
 
+    # --- 検出器シグナル → GUIスレッドへの配線とワーカー起動 ---
+    def _wire_detector_signals(self):
         # 検出器シグナル → GUIスレッドへのマーシャリング（Qtの既定でキュー接続＝GUIスレッド実行）。
         #   frame_ready: カメラ別ワーカーが作った表示フレームを setPixmap する。
         #   final_ready: 個体確定結果を process_final_result（リレー制御・履歴表示）へ渡す。
@@ -373,11 +394,14 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         # カメラ起動後にカメラ別処理ワーカーを起動する（運転は set_running で切替）
         self.detector.start_workers()
 
-        # イベント接続
+    # --- GUIイベント（トグル・設定・電源ボタン）の配線 ---
+    def _wire_gui_events(self):
         self.toggle_switch.toggled.connect(self.on_main_toggled)
         self.button_setting.clicked.connect(self.on_setting_button)
         self.button_power.clicked.connect(self.on_power_bottom)
 
+    # --- タイマー初期化（表示互換用・ヘルスログ）---
+    def _init_timers(self):
         # 表示更新はカメラ別ワーカーの frame_ready シグナルが駆動するため、
         #   旧 QTimer 駆動の update_video_feeds は使わない。timer オブジェクトは
         #   エラー/終了処理の self.timer.stop() 互換のため生成だけしておく（未開始）。
@@ -388,12 +412,14 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         self.health_timer.timeout.connect(self.update_health)
         self.health_timer.start(1000)
 
+    # --- 起動時のGUI/パトライト初期表示と非常停止状態の問い合わせ ---
+    def _init_startup_display(self):
         # 全デバイス接続完了 → 待機中 (RED)
         self.patlite.set_system_state(p_ctr.SystemState.STANDBY)
 
         # 起動時は PCモード として表示
         self.label_mode.setText("PCモード")
-        self.label_mode.setStyleSheet(module_gui_JP_v3.LABEL_MODE_STYLE_PC)
+        self.label_mode.setStyleSheet(module_gui_JP.LABEL_MODE_STYLE_PC)
 
         # モード表示パネルの初期化（パルス速度・モデル名）。
         #   モデル名は読込中の重みファイル名を表示（将来モード切替の値に差し替え予定）。
@@ -416,24 +442,12 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
     # --- カメラ表示遅延をスピードに合わせて更新する関数 ---
     def update_camera_delays(self):
-        # フォールバック値（delay_config.json が無い場合に使用）
-        _FALLBACK = {"cam_under": 2.023, "cam_inside": 2.015}
-
-        delays = dict(_FALLBACK)
         config_path = os.path.join(os.path.dirname(__file__), "json", "delay_config.json")
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                for cam in _FALLBACK:
-                    if cam in loaded and isinstance(loaded[cam], (int, float)):
-                        delays[cam] = float(loaded[cam])
-                log.info("遅延設定を読み込みました: %s (更新日時: %s)",
-                         config_path, loaded.get("updated_at", "不明"))
-            except Exception as e:
-                log.warning("delay_config.json の読み込みに失敗。フォールバック値を使用: %s", e)
-        else:
-            log.warning("delay_config.json が見つかりません。フォールバック値を使用: %s", config_path)
+        with open(config_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        delays = {"cam_under": float(loaded["cam_under"]), "cam_inside": float(loaded["cam_inside"])}
+        log.info("遅延設定を読み込みました: %s (更新日時: %s)",
+                 config_path, loaded.get("updated_at", "不明"))
 
         log.info("表示遅延を設定  cam_under=%.3fs / cam_inside=%.3fs",
                  delays["cam_under"], delays["cam_inside"])
@@ -648,7 +662,7 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
         # モードラベルを「単体モード」に更新
         self.label_mode.setText("単体モード")
-        self.label_mode.setStyleSheet(module_gui_JP_v3.LABEL_MODE_STYLE_STANDALONE)
+        self.label_mode.setStyleSheet(module_gui_JP.LABEL_MODE_STYLE_STANDALONE)
 
         # ブロッキングオーバーレイでGUI全体をロック（電源ボタンは前面に維持）
         self.blocking_overlay.show()
@@ -680,7 +694,7 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
         # モードラベルを「PCモード」に戻す
         self.label_mode.setText("PCモード")
-        self.label_mode.setStyleSheet(module_gui_JP_v3.LABEL_MODE_STYLE_PC)
+        self.label_mode.setStyleSheet(module_gui_JP.LABEL_MODE_STYLE_PC)
 
         # ブロッキングオーバーレイを非表示にしてGUI操作を再開
         self.blocking_overlay.hide()
@@ -749,6 +763,86 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
             "cycle_dur[s]":        v("cycle_dur_s"),
         }
 
+    # --- HSV通過・YOLO無検出の cycle ログだけを残す（リレーは動かさない）---
+    def _log_no_detection_cycle(self, result_obj):
+        _hw = self.tele.snapshot()
+        self.dcr.cycle(
+            cycle_id=result_obj.id,
+            hsv_mask_ratio=result_obj.hsv_mask_ratio if result_obj.hsv_mask_ratio is not None else "",
+            yolo_no_det_flag=1,
+            **{"capture_latency[ms]": result_obj.capture_latency_ms if result_obj.capture_latency_ms is not None else "",
+               "frame_dropped[n]":    result_obj.frame_dropped if result_obj.frame_dropped is not None else "",
+               "hsv_flag":            result_obj.hsv_pass if result_obj.hsv_pass is not None else ""},
+            **self._cost_columns(result_obj),
+            **_hw,
+        )
+
+    # --- クラス→表示名・リレー先を判定する（健全果のみ運搬、それ以外は除去）---
+    #   表示名と色は module_gui_JP.CLASS_DISPLAY に一元化している。
+    def _resolve_channel(self, disease_name):
+        info = module_gui_JP.CLASS_DISPLAY.get(disease_name)
+        if info is not None:
+            channel = (r_ctr.RelayChannel.TRANSPORT
+                       if disease_name == "healthy"
+                       else r_ctr.RelayChannel.REMOVE)
+            return channel, info["jp"]
+
+        # CLASS_DISPLAY 未登録クラス（モデルに新クラスが増えた等）。
+        #   無言で排出されず・IDだけ欠番になる(=ID飛び)のを防ぐため、
+        #   不良として除去し、英語ラベルのまま表示・警告ログを残す。
+        log.warning("未登録クラス '%s' を検出。不良として除去します。CLASS_DISPLAYへの登録を推奨。",
+                    disease_name)
+        return r_ctr.RelayChannel.REMOVE, disease_name
+
+    # --- cycle ログ1行目（確定直後に書けるデータ）を記録する ---
+    #   eject_decision: 除去(REMOVE)=1 / 健全運搬(TRANSPORT)=0
+    #   capture_latency_ms / frame_dropped / preproc_ms / postproc_ms は
+    #   _attach_cycle_stats が result_obj に付与した集計値
+    def _log_cycle_row(self, result_obj, obj_id, channel):
+        # HW負荷系スナップショット（health 1Hz の最新キャッシュ値）。
+        #   この果実を推論した瞬間のGPU/CPU状態を per-cycle 相関用に写す。
+        _hw = self.tele.snapshot()
+        self.dcr.cycle(
+            cycle_id=obj_id,
+            hsv_mask_ratio=result_obj.hsv_mask_ratio if result_obj.hsv_mask_ratio is not None else "",
+            **{"capture_latency[ms]": result_obj.capture_latency_ms if result_obj.capture_latency_ms is not None else "",
+               "frame_dropped[n]":    result_obj.frame_dropped if result_obj.frame_dropped is not None else "",
+               "hsv_flag":            result_obj.hsv_pass if result_obj.hsv_pass is not None else "",
+               "infer_latency[ms]":   result_obj.infer_avg_ms if result_obj.infer_avg_ms is not None else "",
+               "preproc[ms]":         result_obj.preproc_ms if result_obj.preproc_ms is not None else "",
+               "postproc[ms]":        result_obj.postproc_ms if result_obj.postproc_ms is not None else "",
+               "eject_flag":          1 if channel == r_ctr.RelayChannel.REMOVE else 0,
+               "yolo_no_det_flag":    0},
+            **self._cost_columns(result_obj),
+            **_hw,
+        )
+
+    # --- 履歴表示用レコードを組み立てて history_data に積む ---
+    def _append_history_record(self, result_obj, obj_id, disease_name):
+        # クラス別の最大信頼度（信頼度降順）。空なら確定クラス単体で代替する。
+        breakdown = list(result_obj.class_breakdown) or [(disease_name, result_obj.confidence)]
+        # 表示順は「確定クラスを左端 → 残りは信頼度降順」にする。
+        #   確定クラス(disease_name)は優先ロジックで決まり最大信頼度とは限らないため、
+        #   信頼度降順の breakdown から確定クラスを抜き出して先頭へ移す。
+        confirmed = [bd for bd in breakdown if bd[0] == disease_name]
+        others    = [bd for bd in breakdown if bd[0] != disease_name]
+        if confirmed:
+            breakdown = confirmed + others
+        else:
+            # 万一 breakdown に確定クラスが無ければ確定クラス単体を先頭に補う
+            breakdown = [(disease_name, result_obj.confidence)] + others
+        record = {
+            "id": obj_id,
+            "final": disease_name,      # 確定クラス（英語ラベル）
+            "breakdown": breakdown,     # [(英語ラベル, 信頼度0〜1), ...] 確定クラス先頭・残り降順
+            # カメラ別の最高信頼度クラス {cam_name: (英語ラベル, 信頼度0〜1)}。
+            #   GUIのカメラ別列(inside/outside/top/under)が読む。検出無しのカメラはキー無し。
+            "per_cam": dict(getattr(result_obj, "per_cam_breakdown", {}) or {}),
+        }
+        self.history_data.append(record)
+        if len(self.history_data) > 5:
+            self.history_data.pop(0)
+
     # --- 確定した推論結果をGUIとリレーに反映する関数 ---
     def process_final_result(self, result_obj):
         if not self.toggle_switch.isChecked():
@@ -756,95 +850,25 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
         # HSV通過・YOLO無検出: リレーは動かさず cycle ログだけ残して終了
         if getattr(result_obj, 'yolo_no_det_flag', 0) == 1:
-            _hw = self.tele.snapshot()
-            self.dcr.cycle(
-                cycle_id=result_obj.id,
-                hsv_mask_ratio=result_obj.hsv_mask_ratio if result_obj.hsv_mask_ratio is not None else "",
-                yolo_no_det_flag=1,
-                **{"capture_latency[ms]": result_obj.capture_latency_ms if result_obj.capture_latency_ms is not None else "",
-                   "frame_dropped[n]":    result_obj.frame_dropped if result_obj.frame_dropped is not None else "",
-                   "hsv_flag":            result_obj.hsv_pass if result_obj.hsv_pass is not None else ""},
-                **self._cost_columns(result_obj),
-                **_hw,
-            )
+            self._log_no_detection_cycle(result_obj)
             return
 
         disease_name = result_obj.label_name
         confidence_percent = int(result_obj.confidence * 100)
         obj_id = result_obj.id
 
-        channel = None
-        display_name = ""
-
         if disease_name in self.detection_counts:
             self.detection_counts[disease_name] += 1
 
-        # クラス→表示名・リレー先を判定（健全果のみ運搬、それ以外は除去）。
-        #   表示名と色は module_gui_JP_v3.CLASS_DISPLAY に一元化している。
-        info = module_gui_JP_v3.CLASS_DISPLAY.get(disease_name)
-        if info is not None:
-            display_name = info["jp"]
-            channel = (r_ctr.RelayChannel.TRANSPORT
-                       if disease_name == "healthy"
-                       else r_ctr.RelayChannel.REMOVE)
-        else:
-            # CLASS_DISPLAY 未登録クラス（モデルに新クラスが増えた等）。
-            #   無言で排出されず・IDだけ欠番になる(=ID飛び)のを防ぐため、
-            #   不良として除去し、英語ラベルのまま表示・警告ログを残す。
-            log.warning("未登録クラス '%s' を検出。不良として除去します。CLASS_DISPLAYへの登録を推奨。",
-                        disease_name)
-            display_name = disease_name
-            channel = r_ctr.RelayChannel.REMOVE
+        channel, display_name = self._resolve_channel(disease_name)
 
         if channel is not None:
             # リレー制御 + 排出ログ（バックグラウンドで実行し、完了後に cycle 補完行を書く）
             self.run_in_background(self._relay_and_log, channel, self.saved_speed, obj_id)
 
-            # --- cycle ログ1行目（確定直後に書けるデータ）---
-            #   eject_decision: 除去(REMOVE)=1 / 健全運搬(TRANSPORT)=0
-            #   capture_latency_ms / frame_dropped / preproc_ms / postproc_ms は
-            #   _attach_cycle_stats が result_obj に付与した集計値
-            # HW負荷系スナップショット（health 1Hz の最新キャッシュ値）。
-            #   この果実を推論した瞬間のGPU/CPU状態を per-cycle 相関用に写す。
-            _hw = self.tele.snapshot()
-            self.dcr.cycle(
-                cycle_id=obj_id,
-                hsv_mask_ratio=result_obj.hsv_mask_ratio if result_obj.hsv_mask_ratio is not None else "",
-                **{"capture_latency[ms]": result_obj.capture_latency_ms if result_obj.capture_latency_ms is not None else "",
-                   "frame_dropped[n]":    result_obj.frame_dropped if result_obj.frame_dropped is not None else "",
-                   "hsv_flag":            result_obj.hsv_pass if result_obj.hsv_pass is not None else "",
-                   "infer_latency[ms]":   result_obj.infer_avg_ms if result_obj.infer_avg_ms is not None else "",
-                   "preproc[ms]":         result_obj.preproc_ms if result_obj.preproc_ms is not None else "",
-                   "postproc[ms]":        result_obj.postproc_ms if result_obj.postproc_ms is not None else "",
-                   "eject_flag":          1 if channel == r_ctr.RelayChannel.REMOVE else 0,
-                   "yolo_no_det_flag":    0},
-                **self._cost_columns(result_obj),
-                **_hw,
-            )
+            self._log_cycle_row(result_obj, obj_id, channel)
+            self._append_history_record(result_obj, obj_id, disease_name)
 
-            # クラス別の最大信頼度（信頼度降順）。空なら確定クラス単体で代替する。
-            breakdown = list(result_obj.class_breakdown) or [(disease_name, result_obj.confidence)]
-            # 表示順は「確定クラスを左端 → 残りは信頼度降順」にする。
-            #   確定クラス(disease_name)は優先ロジックで決まり最大信頼度とは限らないため、
-            #   信頼度降順の breakdown から確定クラスを抜き出して先頭へ移す。
-            confirmed = [bd for bd in breakdown if bd[0] == disease_name]
-            others    = [bd for bd in breakdown if bd[0] != disease_name]
-            if confirmed:
-                breakdown = confirmed + others
-            else:
-                # 万一 breakdown に確定クラスが無ければ確定クラス単体を先頭に補う
-                breakdown = [(disease_name, result_obj.confidence)] + others
-            record = {
-                "id": obj_id,
-                "final": disease_name,      # 確定クラス（英語ラベル）
-                "breakdown": breakdown,     # [(英語ラベル, 信頼度0〜1), ...] 確定クラス先頭・残り降順
-                # カメラ別の最高信頼度クラス {cam_name: (英語ラベル, 信頼度0〜1)}。
-                #   GUIのカメラ別列(inside/outside/top/under)が読む。検出無しのカメラはキー無し。
-                "per_cam": dict(getattr(result_obj, "per_cam_breakdown", {}) or {}),
-            }
-            self.history_data.append(record)
-            if len(self.history_data) > 5:
-                self.history_data.pop(0)
             log.info("判定確定 | ID:%03d | 結果:%s | 信頼度:%d%%", obj_id, display_name, confidence_percent)
             self.update_history_display()
 
@@ -918,6 +942,11 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
 
     # --- 履歴表示を更新する関数 (HTMLテーブル版) ---
     def update_history_display(self):
+        self._render_history_table()
+        self._render_stats_grid()
+
+    # --- 判定履歴テーブル（ID + カメラ別列）の描画 ---
+    def _render_history_table(self):
         # 列構成（固定）: ID / inside / outside / top / under。
         #   確定クラス専用列は廃止。各カメラ列に「そのカメラの検出クラス＋信頼度」を表示し、
         #   確定クラス(4カメラ集約で決めた1クラス)を検出した列は「◎確定クラス」を赤枠で優先表示する
@@ -985,12 +1014,13 @@ class MainWindow(module_gui_JP_v3.MainWindowUI):
         """
         self.label_history.setText(full_html)
 
-        # --- 個数スタック欄（クラス名=結果表示と同じ色付き矩形、個数=黒太字）---
+    # --- 個数スタック欄（クラス名=結果表示と同じ色付き矩形、個数=黒太字）の描画 ---
+    def _render_stats_grid(self):
         c = self.detection_counts
 
         def _stat_cell(label_key, jp, value):
             # 結果表示のチップと同じ配色でクラス名を矩形に囲う（色は CLASS_DISPLAY 準拠）。
-            info = module_gui_JP_v3.CLASS_DISPLAY.get(label_key, {"jp": jp, "color": "#CCCCCC"})
+            info = module_gui_JP.CLASS_DISPLAY.get(label_key, {"jp": jp, "color": "#CCCCCC"})
             bg   = info["color"]
             text_color, border = _chip_colors(bg)
             return (

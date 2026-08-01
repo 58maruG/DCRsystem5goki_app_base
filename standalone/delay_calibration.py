@@ -46,7 +46,7 @@ if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
 # main.py（Arduino版）と同じカメラ/モーターモジュールを使う
-import module_cameras_5goki_v2 as cam_ctr
+import module_cameras_5goki as cam_ctr
 import module_motor_serial as motor_ctr
 
 # ==========================================================

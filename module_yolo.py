@@ -25,50 +25,19 @@ log = log_config.get_logger("yolo")
 _logged_hsv_paths: set[str] = set()
 _hsv_config_cache: dict[str, dict] = {}
 
-# ================================================
-# HSV前処理（マスク生成・虚像除去・果柄除去）の既定値
-# ================================================
-# カメラ別JSON（json/hsv_config_{cam}.json）に該当キーが無い場合のフォールバック。
-# 既定は「虚像除去・果柄除去とも無効」＝旧実装と1ビットも変わらないマスクになる値。
-#   reflect_sat / reflect_v : 範囲が全域(0〜255)なら無効
-#   stem_open               : 0 なら無効
-# 実際に有効化するのは各カメラのJSON側（本ディレクトリでは base方式の値を投入済み）。
-DEFAULT_HSV_CFG = {
-    'lower1': [0, 100, 100],   'upper1': [32, 255, 255],
-    'lower2': [160, 100, 100], 'upper2': [180, 255, 255],
-    'reflect_sat_lo': 0, 'reflect_sat_hi': 255,
-    'reflect_v_lo':   0, 'reflect_v_hi':   255,
-    'stem_open':      0,
-}
 
-# 果実候補とみなす最小ブロブ面積[px]。1段目でこれ未満なら整形せず棄却する。
-# カメラ別JSONに min_blob_area があればそちらが優先される（hsv_calibration.py で調整）。
-MIN_BLOB_AREA = 500
-
-
-def _load_hsv_config(cam_name: str | None) -> dict:
-    """カメラ別HSV設定を読む。初回のみJSONを読み、以降はキャッシュを返す。
-    新キー(reflect_*/stem_open)を持たない旧JSONでも既定値で補完されるため、
-    raw ディレクトリの設定をそのまま持ってきても従来どおり動く。
-    設定が壊れていても既定値で継続し、ラインを止めない。"""
-    key = cam_name or "_default"
-    cached = _hsv_config_cache.get(key)
+def _load_hsv_config(cam_name: str) -> dict:
+    """カメラ別HSV設定（json/hsv_config_{cam}.json）を読む。初回のみJSONを読み、以降はキャッシュを返す。
+    ファイルが無い/壊れている場合はここで例外を送出する（hsv_calibration.py で作成済みである前提）。"""
+    cached = _hsv_config_cache.get(cam_name)
     if cached is not None:
         return cached
 
-    cfg  = dict(DEFAULT_HSV_CFG)
-    path = os.path.join("json", f"hsv_config_{cam_name}.json") if cam_name else None
-    if path and os.path.exists(path):
-        try:
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                cfg.update(json.load(f))
-            if path not in _logged_hsv_paths:
-                log.info("HSV設定を読み込みました: %s", path)
-                _logged_hsv_paths.add(path)
-        except Exception as e:
-            log.warning("HSV設定の読込に失敗しました（既定値で継続）: %s - %s", path, e)
-    elif path and path not in _logged_hsv_paths:
-        log.warning("HSV設定が見つかりません（既定値で動作）: %s", path)
+    path = os.path.join("json", f"hsv_config_{cam_name}.json")
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        cfg = json.load(f)
+    if path not in _logged_hsv_paths:
+        log.info("HSV設定を読み込みました: %s", path)
         _logged_hsv_paths.add(path)
 
     # 整形（果柄除去・虚像除去）を走らせる必要があるかを一度だけ判定してキャッシュする。
@@ -78,13 +47,7 @@ def _load_hsv_config(cam_name: str | None) -> dict:
     v_active = not (cfg['reflect_v_lo']   <= 0 and cfg['reflect_v_hi']   >= 255)
     cfg['_refine'] = bool(int(cfg['stem_open']) > 0 or s_active or v_active)
 
-    # 最小ブロブ面積・搬送速度は hsv_calibration.py で調整・保存できる。
-    #   JSONに無い場合は上のコード内定数がそのまま使われる。
-    cfg.setdefault('min_blob_area', MIN_BLOB_AREA)
-    cfg.setdefault('fruit_speed_px',
-                   FRUIT_SPEED_PX.get(cam_name, DEFAULT_FRUIT_SPEED_PX))
-
-    _hsv_config_cache[key] = cfg
+    _hsv_config_cache[cam_name] = cfg
     return cfg
 
 # ================================================
@@ -115,21 +78,7 @@ HSV_DETECT_SCALE = 0.7
 #   増やす → 判定に使える情報が増えるがGPU負荷も比例して増える。
 INFER_FRAMES_PER_CAM = 3
 
-# 果実の搬送速度【px/フレーム・カメラ別】。ROI幅がカメラごとに異なり、写る大きさも
-#   違うため、絶対pxでカメラ別に持つ。
-#   初期値は 2026-07-21 に実運用画像＋0623の検出数から較正した実測値。
-#   実機で果実の移動量が変わったら hsv_calibration.py で測り直して調整する。
-#   ※ カメラ別JSONに fruit_speed_px があればそちらが優先される。
-FRUIT_SPEED_PX = {
-    'cam_top':     87,   # ROI幅 640
-    'cam_under':   87,   # ROI幅 640
-    'cam_inside':  91,   # ROI幅 560
-    'cam_outside': 87,   # ROI幅 500
-}
-DEFAULT_FRUIT_SPEED_PX = 87   # 上記に無いカメラ用のフォールバック
-
-
-def infer_window_px(cam_name: str | None) -> int:
+def infer_window_px(cam_name: str) -> int:
     """推論する中心窓の半幅[px]を返す。ROI中心から ±この距離に果実の重心がある間だけ推論する。
 
     窓幅 = 速度 × 枚数 / 2 とすることで、窓の通過中にちょうど INFER_FRAMES_PER_CAM 枚
@@ -188,7 +137,6 @@ MIN_VISIBLE_SEC = 0.12
 # ================================================
 # ファイル保存設定
 # ================================================
-SAVE_DIR_IMG      = "evaluated_images"
 SAVE_DIR_TRAINING = "training_images"
 MIN_TRAINING_AREA = 25000   # 学習用画像として保存する最小検出面積（小さすぎるフレームを除外）
 FPS               = 20.0
@@ -275,12 +223,6 @@ class OutputLogger:
     def __init__(self, dcr=None) -> None:
         self.dcr = dcr
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # 実行ごとのサブフォルダ（IDの重複防止）
-        self.run_img_dir = os.path.join(SAVE_DIR_IMG, timestamp)
-        #os.makedirs(self.run_img_dir, exist_ok=True)  # 画像保存一時停止 ← 再開時はコメントを外す
-
         # 学習用画像ディレクトリ（YOLOクラス名別・実行をまたいで蓄積）
         self.valid_cam_names = ('cam_top', 'cam_under', 'cam_inside', 'cam_outside')
         #os.makedirs(SAVE_DIR_TRAINING, exist_ok=True)  # 画像保存一時停止 ← 再開時はコメントを外す
@@ -328,60 +270,15 @@ class OutputLogger:
         #    filepath  = os.path.join(cls_dir, filename)
         #    cv2.imwrite(filepath, frame)
 
-    @staticmethod
-    def _placeholder_tile(cam_name: str):
-        """合格フレームも直近フレームも無いカメラ用の代替タイル。
-        純黒(np.zeros)だと象限が完全に潰れて原因が分からないため、
-        グレー背景＋カメラ名＋"NO SIGNAL"を描いて「映像が無かった」ことを明示する。"""
-        tile = np.full((YOLO_IMG_SIZE, YOLO_IMG_SIZE, 3), 60, dtype=np.uint8)
-        for text, y in ((cam_name, YOLO_IMG_SIZE // 2 - 20), ("NO SIGNAL", YOLO_IMG_SIZE // 2 + 30)):
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
-            cv2.putText(tile, text, ((YOLO_IMG_SIZE - tw) // 2, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2, cv2.LINE_AA)
-        return tile
-
-    def write_evaluated_image(self, frames_dict: dict, obj_id: int,
-                               label_name: str, fallback_frames: dict | None = None,
-                               last_frames: dict | None = None) -> None:
-        """4カメラのアノテーション済みフレームを2×2タイルで1枚保存する。
-        各象限は次の優先順で埋める（純黒を出さないことで「黒タイル」問題を回避）:
-          1. タイル用最良フレーム（YOLO検出＞HSV） (frames_dict)
-          2. HSVで捉えた学習用の生フレーム          (fallback_frames)
-          3. そのカメラの直近フレーム                (last_frames)
-          4. グレーの "NO SIGNAL" プレースホルダ"""
-        # 画像保存一時停止 ← 再開時はコメントを外す
-        #cam_order = ['cam_inside', 'cam_outside', 'cam_under', 'cam_top']
-        #tiles = []
-        #for cam in cam_order:
-        #    if frames_dict and cam in frames_dict:
-        #        tiles.append(cv2.resize(frames_dict[cam], (YOLO_IMG_SIZE, YOLO_IMG_SIZE)))
-        #    elif fallback_frames and cam in fallback_frames:
-        #        tiles.append(cv2.resize(fallback_frames[cam], (YOLO_IMG_SIZE, YOLO_IMG_SIZE)))
-        #    elif last_frames and last_frames.get(cam) is not None:
-        #        tiles.append(cv2.resize(last_frames[cam], (YOLO_IMG_SIZE, YOLO_IMG_SIZE)))
-        #    else:
-        #        tiles.append(self._placeholder_tile(cam))
-        #tile      = np.vstack((np.hstack((tiles[0], tiles[1])), np.hstack((tiles[2], tiles[3]))))
-        #timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        #filename  = f"id{obj_id:04d}_{label_name}_{timestamp}.jpg"
-        #filepath  = os.path.join(self.run_img_dir, filename)
-        #cv2.imwrite(filepath, tile)
-
 
 # ================================================
 # 画像処理ユーティリティクラス
 # ================================================
 class ImageProcessor:
     @staticmethod
-    def get_target_info(frame, cam_name: str | None = None) -> dict | None:
+    def get_target_info(frame, cam_name: str) -> dict | None:
         # ここはYOLO判定ではなく「サクランボが視野内にいるか（存在）」を追うためのHSV赤マスク
-        #
-        # ── HSV 設定の切り替え方 ──────────────────────────────────────────
-        # [A] カメラ別JSON（hsv_calibration.py で生成）を優先する ← 現在の設定
-        #       hsv_config_{cam_name}.json → hsv_config.json → デフォルト値
-        #       の順にフォールバックするので、カメラ別ファイルが無くても動く。
-        # ──────────────────────────────────────────────────────────────────
-
+        # HSV設定は json/hsv_config_{cam_name}.json（hsv_calibration.py で生成）から読む。
         cfg = _load_hsv_config(cam_name)
         h, w = frame.shape[:2]
 
@@ -534,7 +431,7 @@ class YoloDetector:
         self.current_cherry_id = 1
         self.last_seen_time    = time.monotonic()  # いずれかのカメラが最後に検出した時刻（不在判定用）
 
-        # カメラごとの直近フレーム（合成タイルの最終フォールバック用・個体をまたいで保持）
+        # カメラごとの直近フレーム（世代ガードで推論結果を捨てた際の表示フォールバック用）
         self.last_frame_per_cam = {c: None for c in CAM_NAMES}
 
         # 現在追跡中の1個体の状態（_reset_object で初期化）
@@ -576,7 +473,6 @@ class YoloDetector:
         self.obj_last_seen      = None    # 現個体が最後に見えた時刻
         self.obj_has_detection  = False   # 現個体でYOLO検出があったか
         self.obj_detections     = []      # 現個体のYoloResult履歴（全カメラ）
-        self.obj_cam_tile       = {}      # タイル用: {cam: {'frame','priority','metric'}}
         self.obj_cam_train      = {}      # 学習用:   {cam: {'min_dist','frame'}}（生フレーム）
         self.obj_infer_ms_sum   = 0.0     # 現個体の推論時間の合計(ms)
         self.obj_infer_count    = 0       # 現個体で推論したフレーム数
@@ -609,16 +505,6 @@ class YoloDetector:
             tot['cap_frames'] += t['cap_frames']
         return tot
 
-    def _update_cam_tile(self, cam_name: str, frame,
-                          priority: int, metric: float) -> None:
-        """タイル用フレーム保持を一本化して更新する。
-        priority: 2=YOLO検出 / 1=HSVのみ。 metric: 同priority内の優劣（大きいほど良い）。
-          - YOLO検出: metric = confidence（高いほど良い）
-          - HSVのみ : metric = -center_dist（中心に近いほど良い）"""
-        cur = self.obj_cam_tile.get(cam_name)
-        if cur is None or priority > cur['priority'] or (priority == cur['priority'] and metric > cur['metric']):
-            self.obj_cam_tile[cam_name] = {'frame': frame.copy(), 'priority': priority, 'metric': metric}
-
     def _finalize_object(self) -> YoloResult | None:
         """現個体を確定（または破棄）する。確定したら YoloResult を返す。
         入口ヒステリシス: 可視時間が MIN_VISIBLE_SEC 未満かつYOLO検出も無い blip は破棄しIDを進めない。"""
@@ -635,12 +521,6 @@ class YoloDetector:
                         # cycle ログ用の集計を best に添える（main が process_final_result で読む）
                         self._attach_cycle_stats(best, visible_dur=visible_dur)
                         result = best
-                        cid    = best.id
-                        # 評価済みタイル: タイル用最良フレーム→学習用生フレーム→直近→プレースホルダ で4枚合成
-                        tile_frames  = {cam: d['frame'] for cam, d in self.obj_cam_tile.items()}
-                        train_frames = {cam: d['frame'] for cam, d in self.obj_cam_train.items()}
-                        self.logger.write_evaluated_image(tile_frames, cid, best.label_name,
-                                                          train_frames, self.last_frame_per_cam)
                         # 学習用画像: 各カメラを「そのカメラの最高信頼度クラス」フォルダに保存
                         for cam, d in self.obj_cam_train.items():
                             self.logger.write_training_image(cam, d['frame'], d['label'])
@@ -1054,14 +934,11 @@ class YoloDetector:
                 entry['conf']  = best_result.confidence
                 entry['label'] = best_result.label_name
 
-        # タイル用フレーム + obj_detections への蓄積
-        if best_result.label_name != "None":
-            if best_result.confidence >= STRICT_THRESHOLDS.get(best_result.label_name, 0.0):
-                self.obj_detections.append(best_result)
-                self.obj_has_detection = True
-            self._update_cam_tile(cam_name, annotated_frame, 2, best_result.confidence)
-        else:
-            self._update_cam_tile(cam_name, annotated_frame, 1, -center_dist)
+        # obj_detections への蓄積
+        if best_result.label_name != "None" and \
+           best_result.confidence >= STRICT_THRESHOLDS.get(best_result.label_name, 0.0):
+            self.obj_detections.append(best_result)
+            self.obj_has_detection = True
 
         self._buffer_frame(cam_name, annotated_frame)
         return annotated_frame

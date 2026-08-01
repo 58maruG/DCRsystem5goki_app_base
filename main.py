@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # main.py
-#   実行専用エントリポイント。GUI/制御ロジックは module_main_window_JP_v3 に分離済み。
-#   黒タイル対策の統合設計版。判定ロジックを module_yolo_csv4（状態機械＋フレーム保持一本化）
+#   実行専用エントリポイント。GUI/制御ロジックは module_main_window_JP に分離済み。
+#   黒タイル対策の統合設計版。判定ロジックを module_yolo（状態機械＋フレーム保持一本化）
 #   に差し替えただけで、その他は main_5goki_JP.py と同一。旧版はそのまま温存してある。
 # -------------------------------------------------
 import sys
@@ -9,7 +9,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 import log_config
-from module_main_window_JP_v3 import StartupWindow
+from module_main_window_JP import StartupWindow
 
 log = log_config.get_logger("main")
 

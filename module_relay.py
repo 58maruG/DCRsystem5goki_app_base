@@ -24,45 +24,25 @@ YDCI_OPEN_NORMAL    = 0   # YdciOpen 通常オープン
 RELAY_OPEN_TIME    = 0.15    # リレーの開閉時間（秒）
 PULSE_PER_ROTATION = 6400    # TB6600のパルス数（1回転あたり）
 
-# 検知位置から各弁までのターンテーブル回転角度[度]
-REMOVE_ANGLE    = 60    # 被害果除去弁
-TRANSPORT_ANGLE = 120   # 健全果運搬弁
-
 # ================================================
 # リレータイミング補正設定（角度ベース）
 #   standalone/relay_calibration.py（GUIツール）が合わせ込んだ「検知位置→各弁
 #   までの実効回転角度[度]」を書き出すファイル。
 #   待機時間 = sec * (角度 / 360) で実機に合わせる。
-#   ファイルが無い/壊れている場合は既定角度(REMOVE_ANGLE/TRANSPORT_ANGLE)で動作。
 # ================================================
 RELAY_CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "json", "relay_config.json")
 
 
 def load_relay_calibration() -> dict:
-    """リレー待機角度の補正を読み込む。失敗時は既定角度を返す。"""
-    default = {
-        "remove":    {"angle": float(REMOVE_ANGLE)},
-        "transport": {"angle": float(TRANSPORT_ANGLE)},
+    """リレー待機角度の補正（relay_config.json）を読み込む。"""
+    with open(RELAY_CAL_PATH, "r", encoding="utf-8-sig") as f:  # BOM付きでも読めるよう sig
+        cfg = json.load(f)
+    cal = {
+        "remove":    {"angle": float(cfg["remove"]["angle"])},
+        "transport": {"angle": float(cfg["transport"]["angle"])},
     }
-    try:
-        if not os.path.exists(RELAY_CAL_PATH):
-            log.info("リレー補正ファイルが無いため既定角度で動作します: %s", RELAY_CAL_PATH)
-            return default
-        with open(RELAY_CAL_PATH, "r", encoding="utf-8-sig") as f:  # BOM付きでも読めるよう sig
-            cfg = json.load(f)
-        for ch in ("remove", "transport"):
-            node = cfg.get(ch, {})
-            if "angle" in node:
-                default[ch]["angle"] = float(node["angle"])
-        log.info("リレー補正(角度)を読込: %s", default)
-    except Exception as e:
-        # 補正が読めなくても本番を止めないよう、既定角度にフォールバック
-        log.warning("リレー補正の読込に失敗しました（既定角度で継続）: %s", e)
-        return {
-            "remove":    {"angle": float(REMOVE_ANGLE)},
-            "transport": {"angle": float(TRANSPORT_ANGLE)},
-        }
-    return default
+    log.info("リレー補正(角度)を読込: %s", cal)
+    return cal
 
 # ================================================
 # 速度テーブル（speed → HIGH/LOW幅 [秒]）
@@ -172,7 +152,7 @@ class RelayController:
         t_one_pulse = delay * 2
         sec         = t_one_pulse * PULSE_PER_ROTATION * 2  # ギア比が2なので
 
-        # キャリブレーションで合わせ込んだ角度[度]を使う（無ければ既定角度）。
+        # キャリブレーションで合わせ込んだ角度[度]を使う。
         #   待機時間 = sec * (角度 / 360)
         remove_angle    = self.calibration["remove"]["angle"]
         transport_angle = self.calibration["transport"]["angle"]
@@ -180,6 +160,20 @@ class RelayController:
         transport_channel_wait = sec * (transport_angle / 360)
 
         return remove_channel_wait, transport_channel_wait
+
+    # --- 待機後に指定チャンネルを RELAY_OPEN_TIME 秒だけ開弁する（move/fire共通） ---
+    def _wait_then_pulse(self, channel: int, wait_sec: float) -> tuple[bool, float, float]:
+        """戻り値: (開閉とも成功したか, 開弁予定epoch時刻, 実際に開弁したepoch時刻)"""
+        called_at  = time.time()
+        planned_ts = called_at + wait_sec
+        time.sleep(wait_sec)
+
+        t_open   = time.time()
+        ok_open  = self._set_state(channel, RelayState.OPEN)
+        time.sleep(RELAY_OPEN_TIME)
+        ok_close = self._set_state(channel, RelayState.CLOSE)
+
+        return ok_open and ok_close, planned_ts, t_open
 
     # --- リレー動作（指定チャンネル） ---
     def move(self, channel: int, speed: int) -> dict:
@@ -197,17 +191,9 @@ class RelayController:
             return {"ok": False, "planned_eject_ts": None,
                     "valve_opened_ts": None, "eject_delay_ms": None}
 
-        called_at  = time.time()
-        planned_ts = called_at + wait_sec
-        time.sleep(wait_sec)
-
-        t_open   = time.time()
-        ok_open  = self._set_state(channel, RelayState.OPEN)
-        time.sleep(RELAY_OPEN_TIME)
-        ok_close = self._set_state(channel, RelayState.CLOSE)
-
+        ok, planned_ts, t_open = self._wait_then_pulse(channel, wait_sec)
         return {
-            "ok":               ok_open and ok_close,
+            "ok":               ok,
             "planned_eject_ts": planned_ts,
             "valve_opened_ts":  t_open,
             "eject_delay_ms":   round((t_open - planned_ts) * 1000, 2),
@@ -220,20 +206,9 @@ class RelayController:
         if channel not in (RelayChannel.REMOVE, RelayChannel.TRANSPORT):
             log.error("不正なチャンネルが指定されました。")
             return {"ok": False, "planned_eject_ts": None, "valve_opened_ts": None}
-        wait_sec   = max(0.0, wait_sec)
-        called_at  = time.time()
-        planned_ts = called_at + wait_sec
-        time.sleep(wait_sec)
 
-        t_open   = time.time()
-        ok_open  = self._set_state(channel, RelayState.OPEN)
-        time.sleep(RELAY_OPEN_TIME)
-        ok_close = self._set_state(channel, RelayState.CLOSE)
-        return {
-            "ok":               ok_open and ok_close,
-            "planned_eject_ts": planned_ts,
-            "valve_opened_ts":  t_open,
-        }
+        ok, planned_ts, t_open = self._wait_then_pulse(channel, max(0.0, wait_sec))
+        return {"ok": ok, "planned_eject_ts": planned_ts, "valve_opened_ts": t_open}
 
     # --- 全リレー停止 ---
     def stop(self) -> None:

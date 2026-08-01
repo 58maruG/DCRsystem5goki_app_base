@@ -425,7 +425,26 @@ class MainWindowUI(QMainWindow):
         self.setFixedSize(WINDOW_W, WINDOW_H)
         self.setStyleSheet("background-color: #FFFFFF;")
 
-        # --- カメラ表示エリア ---
+        cam_x_left, cam_x_right, cam_y_upper, cam_y_lower = self._build_camera_views()
+        self._build_camera_name_overlays(cam_x_left, cam_x_right, cam_y_upper, cam_y_lower)
+        self._build_power_button()
+
+        history_y       = self._build_history_label()
+        status_y         = self._build_status_bar(history_y)
+        stats_x, stats_y = self._build_stats_label(status_y)
+        self._build_management_panel(stats_x, stats_y)
+        self._build_bottom_left_panel(cam_x_right, cam_y_lower)
+
+        # モードパネル系ウィジェットより前面に出す
+        self.button_setting.raise_()
+
+        # 単体モード用ブロッキングオーバーレイ（電源ボタンより後に生成することで Z-order を制御）
+        self.blocking_overlay = BlockingOverlay(self)
+        self.blocking_overlay.setGeometry(0, 0, WINDOW_W, WINDOW_H)
+        self.blocking_overlay.hide()
+
+    # --- カメラ表示エリア ---
+    def _build_camera_views(self) -> tuple[int, int, int, int]:
         cam_x_left  = MARGIN_X
         cam_x_right = VIEW_CAM_SIZE_W + MARGIN_X + MARGIN_CAM
         cam_y_upper = MARGIN_Y
@@ -451,7 +470,10 @@ class MainWindowUI(QMainWindow):
         self.cam_top.setStyleSheet(LABEL_CAM_STYLE)
         self.cam_top.move(cam_x_right, cam_y_lower)
 
-        # --- カメラ名オーバーレイラベル（各カメラ映像の左上に重ねて表示）---
+        return cam_x_left, cam_x_right, cam_y_upper, cam_y_lower
+
+    # --- カメラ名オーバーレイラベル（各カメラ映像の左上に重ねて表示）---
+    def _build_camera_name_overlays(self, cam_x_left, cam_x_right, cam_y_upper, cam_y_lower) -> None:
         _cn_offset = 4
         self.cam_name_in = QLabel("cam_inside", self)
         self.cam_name_in.setFixedSize(CAM_NAME_LABEL_W, CAM_NAME_LABEL_H)
@@ -473,7 +495,8 @@ class MainWindowUI(QMainWindow):
         self.cam_name_top.setStyleSheet(LABEL_CAM_NAME_STYLE)
         self.cam_name_top.move(cam_x_right + _cn_offset, cam_y_lower + _cn_offset)
 
-        # --- 電源アイコン（右上・従来通り）---
+    # --- 電源アイコン（右上・従来通り）---
+    def _build_power_button(self) -> None:
         power_x = WINDOW_W - ICON_POWER_SIZE - MARGIN_X
         power_y = MARGIN_Y
 
@@ -484,7 +507,8 @@ class MainWindowUI(QMainWindow):
         self.button_power.setCursor(Qt.PointingHandCursor)
         resize_smooth_image(pixmap, self.button_power)
 
-        # --- クラス表示リスト（横長・右カラム上部）---
+    # --- クラス表示リスト（横長・右カラム上部）---
+    def _build_history_label(self) -> int:
         history_x = RIGHT_X
         history_y = MARGIN_Y + ICON_POWER_SIZE + MARGIN_Y
 
@@ -494,7 +518,10 @@ class MainWindowUI(QMainWindow):
         self.label_history.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.label_history.move(history_x, history_y)
 
-        # --- ステータスバー（run / stop / estop / error）---
+        return history_y
+
+    # --- ステータスバー（run / stop / estop / error）---
+    def _build_status_bar(self, history_y: int) -> int:
         status_x = RIGHT_X
         status_y = history_y + LABEL_HISTORY_SIZE_H + MARGIN_Y
 
@@ -503,7 +530,10 @@ class MainWindowUI(QMainWindow):
         self.label_status.setStyleSheet(LABEL_STATUS_STYLE)
         self.label_status.move(status_x, status_y)
 
-        # --- 累計カウント統計（右下・左半分）---
+        return status_y
+
+    # --- 累計カウント統計（右下・左半分）---
+    def _build_stats_label(self, status_y: int) -> tuple[int, int]:
         stats_x = RIGHT_X
         stats_y = status_y + LABEL_STATUS_SIZE_H + MARGIN_Y
 
@@ -512,7 +542,10 @@ class MainWindowUI(QMainWindow):
         self.label_stats.setStyleSheet(LABEL_STATS_STYLE)
         self.label_stats.move(stats_x, stats_y)
 
-        # --- システム管理エリア（統計の右隣・トグルは従来サイズ）---
+        return stats_x, stats_y
+
+    # --- システム管理エリア（統計の右隣・トグルは従来サイズ）---
+    def _build_management_panel(self, stats_x: int, stats_y: int) -> None:
         toggle_w = int(SWITCH_TOGGLE_SIZE_W)
         toggle_h = int(SWITCH_TOGGLE_SIZE_H)
         panel_x  = stats_x + LABEL_STATS_SIZE_W + MARGIN_X
@@ -538,7 +571,8 @@ class MainWindowUI(QMainWindow):
         self.label_toggle_status.setStyleSheet(LABEL_TOGGLE_STYLE)
         self.label_toggle_status.move(toggle_status_x, toggle_status_y)
 
-        # --- 左下：設定ボタン＋モード表示パネル ---
+    # --- 左下：設定ボタン＋モード表示パネル ---
+    def _build_bottom_left_panel(self, cam_x_right: int, cam_y_lower: int) -> None:
         lb_y      = cam_y_lower + VIEW_CAM_SIZE_H + MARGIN_Y
         setting_x = MARGIN_X + 600
         setting_y = lb_y + 65
@@ -605,14 +639,6 @@ class MainWindowUI(QMainWindow):
         self.label_model.setFixedSize(val_w, row_h)
         self.label_model.setStyleSheet(LABEL_MODE_VALUE_STYLE)
         self.label_model.move(val_x, row3_y)
-
-        # モードパネル系ウィジェットより前面に出す
-        self.button_setting.raise_()
-
-        # 単体モード用ブロッキングオーバーレイ（電源ボタンより後に生成することで Z-order を制御）
-        self.blocking_overlay = BlockingOverlay(self)
-        self.blocking_overlay.setGeometry(0, 0, WINDOW_W, WINDOW_H)
-        self.blocking_overlay.hide()
 
 
 # ================================================

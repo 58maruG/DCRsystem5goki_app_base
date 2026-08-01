@@ -3,16 +3,22 @@
 #   ホットパスからは絶対に呼ばない（コストがあるため health スレッドが ≈1Hz で叩く）。
 
 
+def _nvml_handle():
+    """NVMLを一度だけ初期化し、(pynvmlモジュール, GPU0ハンドル) を返す。
+    gpu_stats/gpu_static_info の両方が使う初期化処理を一本化する。"""
+    import pynvml
+    if not getattr(_nvml_handle, "_init", False):
+        pynvml.nvmlInit()
+        _nvml_handle._h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        _nvml_handle._init = True
+    return pynvml, _nvml_handle._h
+
+
 def gpu_stats():
     """nvidia-ml-py (pip install nvidia-ml-py) があれば GPU 情報を返す。無ければ空。
     VRAM使用量・消費電力は HWダウングレード判断（下位カードへ下げられるか）の決定打。"""
     try:
-        import pynvml
-        if not getattr(gpu_stats, "_init", False):
-            pynvml.nvmlInit()
-            gpu_stats._h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_stats._init = True
-        h = gpu_stats._h
+        pynvml, h = _nvml_handle()
         mem = pynvml.nvmlDeviceGetMemoryInfo(h)
         return {
             "gpu_temp": pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU),
@@ -29,12 +35,7 @@ def gpu_static_info():
     """GPU 名・総 VRAM 等の静的情報。startup イベントに載せ、比較の前提を固定する。
     総 VRAM は定数なので毎サンプルではなく startup のみで十分。"""
     try:
-        import pynvml
-        if not getattr(gpu_stats, "_init", False):
-            pynvml.nvmlInit()
-            gpu_stats._h = pynvml.nvmlDeviceGetHandleByIndex(0)
-            gpu_stats._init = True
-        h = gpu_stats._h
+        pynvml, h = _nvml_handle()
         name = pynvml.nvmlDeviceGetName(h)
         return {
             "gpu_name": name.decode() if isinstance(name, bytes) else name,

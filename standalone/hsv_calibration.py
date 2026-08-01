@@ -4,7 +4,7 @@
 4カメラのライブ映像を見ながら、果実検出に関わる閾値をすべてスライダーで調整し、
 カメラ別JSON（json/hsv_config_{cam_name}.json）へ保存する。
 
-本ツールの画像処理は module_yolo_csv4_v3.ImageProcessor.get_target_info() と
+本ツールの画像処理は module_yolo.ImageProcessor.get_target_info() と
 同一手順を再現している（マスク生成・虚像除去・果柄除去は本番と同じ
 hsv_mask_utils を直接呼ぶ）。したがって、ここで
 「検出あり／推論ON」と表示される状態が、そのまま本番の挙動になる。
@@ -20,7 +20,7 @@ hsv_mask_utils を直接呼ぶ）。したがって、ここで
                 推論する中心窓の半幅 = 速度 × 枚数 ÷ 2 で自動計算される。
                 果実の重心がこの窓に入っている間だけ、1カメラあたり
                 INFER_FRAMES_PER_CAM 枚だけYOLO推論が走る。
-                枚数そのものは module_yolo_csv4_v3.INFER_FRAMES_PER_CAM で変更する。
+                枚数そのものは module_yolo.INFER_FRAMES_PER_CAM で変更する。
 
 表示モード:
   検出結果      … 元画像＋採用ブロブの外接矩形＋ゲート2本線
@@ -77,8 +77,9 @@ GRID_LAYOUT = [
 HSV_JSON_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "json")
 
-# module_yolo_csv4_v3.DEFAULT_HSV_CFG / MIN_BLOB_AREA と同じ既定値。
+# カメラ別JSONがまだ無い状態でツールを開いたときのスライダー初期値。
 # 「虚像除去・果柄除去とも無効」＝旧実装と同一マスクになる値。
+# 本番(module_yolo)はJSON必須で既定値を持たないため、ここはツール専用の初期値。
 DEFAULT_CFG = {
     "lower1": [0, 100, 100],   "upper1": [32, 255, 255],
     "lower2": [160, 100, 100], "upper2": [180, 255, 255],
@@ -88,17 +89,17 @@ DEFAULT_CFG = {
     "min_blob_area":  500,
 }
 
-# module_yolo_csv4_v3.FRUIT_SPEED_PX / INFER_FRAMES_PER_CAM と同じ既定値。
-#   JSONに fruit_speed_px が無い場合のみ使う。
+# JSONに fruit_speed_px が無い場合のみ使うツール専用の初期値
+#   （module_yolo.INFER_FRAMES_PER_CAM とは値を必ず揃えること）。
 DEFAULT_FRUIT_SPEED_PX = {
     "cam_top": 87, "cam_under": 87, "cam_inside": 91, "cam_outside": 87,
 }
 FALLBACK_FRUIT_SPEED_PX = 87
-INFER_FRAMES_PER_CAM = 5   # module_yolo_csv4_v3 側と必ず揃えること
+INFER_FRAMES_PER_CAM = 5   # module_yolo 側と必ず揃えること
 
 
 def window_half_px(speed: int) -> int:
-    """推論する中心窓の半幅[px]。module_yolo_csv4_v3.infer_window_px と同じ式。"""
+    """推論する中心窓の半幅[px]。module_yolo.infer_window_px と同じ式。"""
     return max(1, int(round(speed * INFER_FRAMES_PER_CAM / 2.0)))
 
 # スライダー定義: グループ名 → [(表示名, 内部キー, 最小値, 最大値, 説明)]
@@ -429,13 +430,13 @@ class CameraThread:
                     pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), True)
                 except Exception as e:
                     # 4台同時起動時は帯域がカメラ間で分け合われ、pfs保存値(163MB/s)通りに
-                    #   ならないことがある(verify不一致で例外)。module_cameras_5goki_v2.py の
+                    #   ならないことがある(verify不一致で例外)。module_cameras_5goki.py の
                     #   load_pfs_custom と同様、ここで継続してよい（帯域は下で明示設定する）。
                     print(f"[{self.cam_name}] pfs読込エラー（現設定で継続）: {e}")
             else:
                 print(f"[{self.cam_name}] pfsが見つかりません（カメラ現設定で継続）: {pfs_path}")
 
-            # 帯域上限はpfsの値によらずここで明示固定する（module_cameras_5goki_v2.py と同じ対策）。
+            # 帯域上限はpfsの値によらずここで明示固定する（module_cameras_5goki.py と同じ対策）。
             #   先に設定しないとpfs側の値(163MB/s等)で上書きされ得るため、pfs読み込み後に行う。
             if hasattr(cam, 'DeviceLinkThroughputLimit'):
                 cam.DeviceLinkThroughputLimitMode.Value = "On"
