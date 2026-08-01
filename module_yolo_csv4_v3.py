@@ -90,8 +90,22 @@ def _load_hsv_config(cam_name: str | None) -> dict:
 # ================================================
 # モデル・入力設定
 # ================================================
-USE_CROP          = False
 CENTER_THRESHOLD_X = 100
+
+# 帯外常時HSV監視（get_target_info）の縮小率。1.0なら無効＝旧実装と1ビットも変わらない。
+# min_blob_area・stem_open はこの値に応じて get_target_info 内で自動的に再較正され、
+# mx/my/area/stat は呼び出し元が期待するネイティブ座標系へ復元して返す。
+#
+# 0.7を採用（学習データセット7,465枚・cam_top/inside/outsideで実測・2026-08-01検証）:
+#   処理時間 1.86〜2.04倍高速化 / go-no-go一致率 98.4〜99.9% / 座標誤差 p95で1px・面積1%未満
+#   検出漏れの残り(最大1.6%, cam_inside)は「画面端に接触/近接した果実」の境界ケースに限られる。
+#   原因: mask_from_hsv の OPEN/CLOSE カーネルが固定5x5でscale連動していないため、
+#   縮小画像では整形後のブロブ形状がネイティブと変わり、端接触判定が逆転することがある。
+#   画面端は推論ゲート窓（中心窓）の対象外であり、後続フレームでの再検出が見込めるため許容。
+#   詳細: docs/findings_20260722_jetson_verdict.md §6
+#   0.5も試したが検出漏れが2.9〜3.3%まで増える一方、必要な削減幅(目安2.7倍)に対しては
+#   オーバースペックだったため見送り。検証スクリプト: standalone/verify_hsv_detect_scale_real.py
+HSV_DETECT_SCALE = 0.7
 
 # ================================================
 # 推論ゲート（中心窓）設定
@@ -371,27 +385,44 @@ class ImageProcessor:
         cfg = _load_hsv_config(cam_name)
         h, w = frame.shape[:2]
 
+        # 帯外常時監視のコスト削減用（HSV_DETECT_SCALE<1.0）: HSV変換以降を縮小画像で行う。
+        # mx/my/area/stat は呼び出し元がネイティブ座標系前提のため、関数の出口で inv 倍して戻す。
+        scale = HSV_DETECT_SCALE
+        if scale != 1.0:
+            det_frame = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
+                                    interpolation=cv2.INTER_AREA)
+        else:
+            det_frame = frame
+        dh, dw = det_frame.shape[:2]
+        inv = 1.0 / scale
+
         # ── 1段目: 果実検出用HSVマスク（熟度分類器 base と同一の共通実装）──
         #   mask_from_hsv は 2帯 inRange → OPEN(5x5,x2) → CLOSE(5x5,x2)。
         #   果実が居ないフレームはここで弾き、後段の整形を一切走らせない。
-        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        hsv  = cv2.cvtColor(det_frame, cv2.COLOR_BGR2HSV)
         mask = mask_from_hsv(hsv, cfg)
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
         if num_labels <= 1:
             return None
         idx = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
-        min_area = int(cfg['min_blob_area'])
+        # min_blob_area はネイティブpx^2基準の設定値。縮小画像の画素数に合わせ面積比(scale^2)で換算する。
+        min_area = int(cfg['min_blob_area'] * scale * scale)
         if stats[idx, cv2.CC_STAT_AREA] < min_area:
             return None
 
         if not cfg['_refine']:
             # 果柄除去・虚像除去とも無効 → 1段目の結果をそのまま返す（旧実装と同一）
             s = stats[idx]
-            if (s[0] <= 5) or (s[1] <= 5) or ((s[0] + s[2]) >= (w - 5)) or ((s[1] + s[3]) >= (h - 5)):
+            bx = int(round(s[0] * inv)); by = int(round(s[1] * inv))
+            bw = int(round(s[2] * inv)); bh = int(round(s[3] * inv))
+            if (bx <= 5) or (by <= 5) or ((bx + bw) >= (w - 5)) or ((by + bh) >= (h - 5)):
                 return None
-            return {'mx': int(centroids[idx][0]), 'my': int(centroids[idx][1]),
-                    'area': s[4], 'stat': s,
+            area_native = int(round(s[4] * inv * inv))
+            return {'mx': int(round(centroids[idx][0] * inv)),
+                    'my': int(round(centroids[idx][1] * inv)),
+                    'area': area_native,
+                    'stat': np.array([bx, by, bw, bh, area_native]),
                     'labels': labels, 'max_index': idx}
 
         # ── 2段目: 候補ブロブの周辺だけを切り出して整形する ────────────
@@ -399,11 +430,13 @@ class ImageProcessor:
         #   外接矩形＋余白に限れば面積比で 1/4 以下になり、結果は変わらない。
         #   余白は演算の到達距離（開処理=半径 / 閉処理=4）以上を取る。整形は
         #   縮小方向の処理なので、この範囲の外へブロブがはみ出すことはない。
-        pad = max(int(cfg['stem_open']), 4) + 1
+        #   stem_open はネイティブpx基準の半径なので、縮小画像上ではscale倍して使う。
+        stem_open_scaled = max(0, int(round(cfg['stem_open'] * scale)))
+        pad = max(stem_open_scaled, 4) + 1
         bx, by = int(stats[idx, cv2.CC_STAT_LEFT]), int(stats[idx, cv2.CC_STAT_TOP])
         bw, bh = int(stats[idx, cv2.CC_STAT_WIDTH]), int(stats[idx, cv2.CC_STAT_HEIGHT])
-        x0, y0 = max(0, bx - pad),      max(0, by - pad)
-        x1, y1 = min(w, bx + bw + pad), min(h, by + bh + pad)
+        x0, y0 = max(0, bx - pad),       max(0, by - pad)
+        x1, y1 = min(dw, bx + bw + pad), min(dh, by + bh + pad)
 
         sub = mask[y0:y1, x0:x1]
         # 虚像（アクリル反射）除去: 「淡い かつ 明るい」画素を落とす。果実は彩度が高いので残る
@@ -414,7 +447,7 @@ class ImageProcessor:
         # 果柄除去: 開処理で半径より細い突起を切り離す
         #   ※ 熟度分類器は THUMB_SIZE=112 上の値(既定2)。本システムのROIは
         #     500〜640px なので、同等の効果には 5〜6倍の半径が要る。
-        sub = remove_stem(sub, cfg['stem_open'])
+        sub = remove_stem(sub, stem_open_scaled)
 
         n2, lab2, st2, ce2 = cv2.connectedComponentsWithStats(sub)
         if n2 <= 1:
@@ -424,34 +457,29 @@ class ImageProcessor:
         if s2[cv2.CC_STAT_AREA] < min_area:
             return None
 
-        # 切り出し座標を全画面座標へ戻す（帯ゲート・クロップが全画面基準のため）
-        s2[cv2.CC_STAT_LEFT] += x0
-        s2[cv2.CC_STAT_TOP]  += y0
-        if (s2[0] <= 5) or (s2[1] <= 5) or ((s2[0] + s2[2]) >= (w - 5)) or ((s2[1] + s2[3]) >= (h - 5)):
+        # 切り出し座標(縮小スケール)を全画面座標へ戻してからネイティブ座標系へ復元する
+        # （帯ゲート・クロップは呼び出し元でネイティブ座標基準のため）
+        left_native   = int(round((s2[cv2.CC_STAT_LEFT] + x0) * inv))
+        top_native    = int(round((s2[cv2.CC_STAT_TOP]  + y0) * inv))
+        width_native  = int(round(s2[cv2.CC_STAT_WIDTH]  * inv))
+        height_native = int(round(s2[cv2.CC_STAT_HEIGHT] * inv))
+        area_native   = int(round(s2[cv2.CC_STAT_AREA] * inv * inv))
+        if (left_native <= 5) or (top_native <= 5) or \
+           ((left_native + width_native) >= (w - 5)) or ((top_native + height_native) >= (h - 5)):
             return None
 
-        # 帯ゲートは labels[:, x] == max_index で全画面を走査するので、
-        # 採用したブロブだけを全画面サイズのラベルへ貼り直す（値は1に正規化）。
-        labels_full = np.zeros((h, w), dtype=np.int32)
+        # 帯ゲートは labels[:, x] == max_index で全画面を走査する想定の実装だが、
+        # 現在の呼び出し元(_process_frame)は mx/my/area/stat しか参照していない。
+        # 縮小時にネイティブへ拡大コピーする分のコストを払わないよう、
+        # labels は縮小スケールのまま返す（scale=1.0の既定では従来と完全に同一）。
+        labels_full = np.zeros((dh, dw), dtype=np.int32)
         labels_full[y0:y1, x0:x1] = (lab2 == j)
 
-        return {'mx': int(ce2[j][0]) + x0, 'my': int(ce2[j][1]) + y0,
-                'area': s2[4], 'stat': s2,
+        return {'mx': int(round((ce2[j][0] + x0) * inv)),
+                'my': int(round((ce2[j][1] + y0) * inv)),
+                'area': area_native,
+                'stat': np.array([left_native, top_native, width_native, height_native, area_native]),
                 'labels': labels_full, 'max_index': 1}
-
-    @staticmethod
-    def dynamic_crop(frame, target: dict):
-        if not USE_CROP:
-            return frame
-        h, w  = frame.shape[:2]
-        size  = min(int(max(target['stat'][2], target['stat'][3]) * 1.5), w, h)
-        x1 = max(0, target['mx'] - size // 2)
-        y1 = max(0, target['my'] - size // 2)
-        x2 = min(w, x1 + size)
-        y2 = min(h, y1 + size)
-        if x2 == w: x1 = max(0, w - size)
-        if y2 == h: y1 = max(0, h - size)
-        return frame[y1:y2, x1:x2]
 
     @staticmethod
     def draw_inference_band(frame, cam_name, native_width, color=(0, 200, 255), thickness=2):
@@ -929,15 +957,14 @@ class YoloDetector:
                 self._buffer_frame(cam_name, raw)
             return raw, finalized_result
 
-        # ── 前処理（ロック外・クロップ／リサイズ）──
+        # ── 前処理（ロック外・リサイズ）──
+        # center_dist は中心からの距離。CENTER_THRESHOLD_X以上離れている場合は
+        # 「遠い」ことだけ分かればよいので frame.shape[1]//2（画面半幅）に丸める。
         _t_pre = time.perf_counter()
-        if abs(target['mx'] - frame.shape[1] // 2) < CENTER_THRESHOLD_X:
-            input_img   = ImageProcessor.dynamic_crop(frame, target)
-            center_dist = abs(target['mx'] - frame.shape[1] // 2)
-        else:
-            input_img   = frame
+        center_dist = abs(target['mx'] - frame.shape[1] // 2)
+        if center_dist >= CENTER_THRESHOLD_X:
             center_dist = frame.shape[1] // 2
-        input_img_resized = cv2.resize(input_img, (YOLO_IMG_SIZE, YOLO_IMG_SIZE))
+        input_img_resized = cv2.resize(frame, (YOLO_IMG_SIZE, YOLO_IMG_SIZE))
         preproc_ms = (time.perf_counter() - _t_pre) * 1000.0
 
         # ── 推論（_infer_lock で直列化。単一モデルへの同時 predict を防ぐ）──

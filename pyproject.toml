@@ -1,5 +1,5 @@
 [project]
-name = "dcrsystem5goki-pc-app-base"
+name = "dcrsystem5goki-app-base"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"

@@ -23,5 +23,5 @@ Trained_Models/
 json/hsv_config.json
 
 # Python files
-standalone/hsv_test.py
-standalone/hsv_calibration_static.py
+standalone/test_hsv_detect_scale.py
+standalone/verify_hsv_detect_scale_real.py
