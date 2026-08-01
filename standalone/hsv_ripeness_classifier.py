@@ -54,7 +54,7 @@ HEALTHY_DIR = _TRAIN_PATH.parent / f"{_TRAIN_PATH.name}_ripeness_healthy"
 UNRIPE_DIR  = _TRAIN_PATH.parent / f"{_TRAIN_PATH.name}_ripeness_unripe"
 
 _JSON_DIR    = Path(__file__).parent.parent / "json"
-_CONFIG_PATH = _JSON_DIR / "hsv_ripeness_config.json"
+_CONFIG_PATH = _JSON_DIR / "_hsv_ripeness_config.json"
 
 # 果実全体マスクのデフォルト（黄〜橙〜赤を広くカバー）
 DEFAULT_FRUIT_HSV = {
@@ -516,7 +516,7 @@ class MainWindow(QMainWindow):
         h1.addWidget(self._stat_label)
         h1.addStretch()
 
-        btn_cfg = QPushButton("設定を保存\n(hsv_ripeness_config.json)")
+        btn_cfg = QPushButton("設定を保存\n(_hsv_ripeness_config.json)")
         btn_cfg.setFixedSize(190, 46)
         btn_cfg.setToolTip("果実マスク・赤色マスク・閾値設定を JSON に保存します。")
         btn_cfg.clicked.connect(self._save_cfg)
@@ -811,7 +811,7 @@ class MainWindow(QMainWindow):
             "threshold": self._threshold,
             "min_area":  self._min_area,
         })
-        self._sb.showMessage("設定を保存しました: json/hsv_ripeness_config.json")
+        self._sb.showMessage("設定を保存しました: json/_hsv_ripeness_config.json")
 
     def _start_save(self, target: str, save_mode: str):
         if not self._current_cls:

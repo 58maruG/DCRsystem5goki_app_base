@@ -22,7 +22,7 @@
     ],
     "reflect_sat_lo": 0,
     "reflect_sat_hi": 75,
-    "reflect_v_lo": 220,
+    "reflect_v_lo": 195,
     "reflect_v_hi": 255,
     "stem_open": 20,
     "roi_width_at_tuning": 500,

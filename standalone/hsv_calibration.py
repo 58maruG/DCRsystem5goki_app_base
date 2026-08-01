@@ -21,6 +21,12 @@ hsv_mask_utils を直接呼ぶ）。したがって、ここで
                 果実の重心がこの窓に入っている間だけ、1カメラあたり
                 INFER_FRAMES_PER_CAM 枚だけYOLO推論が走る。
                 枚数そのものは module_yolo.INFER_FRAMES_PER_CAM で変更する。
+  [検出縮小率]  module_yolo.HSV_DETECT_SCALE 相当。画面上部のスライダーで調整する
+                （カメラ別ではなく全カメラ共通の1つの値）。HSV変換以降をこの倍率に
+                縮小した画像で処理し、結果はネイティブ座標へ復元して表示する。
+                1.0で無効（ネイティブ解像度のまま＝旧実装と同一）。
+                このツールの値はJSONに保存されない。採用する値が決まったら
+                module_yolo.HSV_DETECT_SCALE へ手動で反映すること。
 
 表示モード:
   検出結果      … 元画像＋採用ブロブの外接矩形＋ゲート2本線
@@ -29,6 +35,14 @@ hsv_mask_utils を直接呼ぶ）。したがって、ここで
   果柄除去後    … remove_stem 適用後（＝最終的に面積判定されるマスク）
   ※ 2段目（虚像除去・果柄除去）は候補ブロブ周辺のみを処理するため、
      切り出し範囲外は黒で表示する（本番でも範囲外は捨てられるため挙動は同じ）。
+
+静止画モード:
+  各カメラ枠の「画像を開く」でJPEG/PNG等の静止画を読み込むと、以後そのカメラは
+  ライブ映像の代わりにその画像を使って解析・プレビューする（スライダー操作にも
+  リアルタイムに追従する）。カメラ未接続の環境でもこのモードだけで調整できる。
+  読み込んだ画像がカメラのネイティブ解像度（NATIVE_SIZE）と異なる場合は自動で
+  リサイズしてから処理する（学習データセットの640x640保存画像を想定）。
+  「ライブに戻す」でカメラ映像に戻る。
 """
 
 import sys
@@ -42,7 +56,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QSpinBox,
-    QGroupBox, QGridLayout, QTabWidget, QComboBox,
+    QGroupBox, QGridLayout, QTabWidget, QComboBox, QFileDialog,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
@@ -65,6 +79,13 @@ TARGET_SERIALS = [
 ]
 
 PREVIEW_W, PREVIEW_H = 380, 380   # プレビュー表示サイズ（4画面一覧用）
+
+# 静止画モードで読み込んだ画像がカメラのネイティブ解像度と異なる場合（例:
+#   学習データセットは全カメラ共通で640x640保存）、この解像度へ合わせてから処理する。
+#   verify_hsv_detect_scale_real.py の NATIVE_SIZE と同じ値。
+NATIVE_SIZE = {
+    "cam_top": 640, "cam_under": 640, "cam_inside": 560, "cam_outside": 500,
+}
 
 # グリッド配置: (cam_name, row, col)  ← ここを変えるだけで並びを変更できる
 GRID_LAYOUT = [
@@ -96,6 +117,12 @@ DEFAULT_FRUIT_SPEED_PX = {
 }
 FALLBACK_FRUIT_SPEED_PX = 87
 INFER_FRAMES_PER_CAM = 5   # module_yolo 側と必ず揃えること
+
+# 帯外常時HSV監視の縮小率スライダーの初期値・範囲（%表示）。
+#   module_yolo.HSV_DETECT_SCALE の初期値と同じにしてあるが、このツールでの調整値は
+#   JSONに保存されないため、採用する値は module_yolo.HSV_DETECT_SCALE へ手動で反映すること。
+DEFAULT_DETECT_SCALE = 0.7
+SCALE_MIN_PCT, SCALE_MAX_PCT = 10, 100
 
 
 def window_half_px(speed: int) -> int:
@@ -137,6 +164,12 @@ VIEW_MODES = ["検出結果", "1段目マスク", "虚像除去後", "果柄除�
 
 # 端接触の判定マージン[px]（get_target_info と同値）
 EDGE_MARGIN = 5
+
+
+def imread_ja(path: str) -> np.ndarray | None:
+    """日本語・スペースを含むパスでも読めるよう imdecode 経由で読む。"""
+    buf = np.fromfile(path, dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
 
 # ==========================================================
@@ -224,14 +257,26 @@ def mask_params(flat: dict) -> dict:
 # ==========================================================
 # 画像処理（get_target_info と同一手順）
 # ==========================================================
-def analyze(frame: np.ndarray, flat: dict) -> dict:
-    """1フレームを本番と同じ手順で処理し、各段階のマスクと判定結果を返す。
+def analyze(frame: np.ndarray, flat: dict, scale: float) -> dict:
+    """1フレームを本番(module_yolo.ImageProcessor.get_target_info)と同じ手順で処理し、
+    各段階のマスクと判定結果を返す。
+
+    scale: HSV_DETECT_SCALE 相当の縮小率。1.0未満なら get_target_info と同様に
+        HSV変換以降を縮小画像で行い、面積・座標をネイティブ座標系へ復元して返す。
 
     status: 'ok'（検出あり） / 'no_blob'（候補なし） / 'too_small'（面積不足）
             / 'edge'（画面端に接触して棄却）
     """
     h, w = frame.shape[:2]
-    hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    if scale != 1.0:
+        det_frame = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
+                                interpolation=cv2.INTER_AREA)
+    else:
+        det_frame = frame
+    dh, dw = det_frame.shape[:2]
+    inv = 1.0 / scale
+    hsv = cv2.cvtColor(det_frame, cv2.COLOR_BGR2HSV)
 
     res = {
         "status": "no_blob", "area": 0, "stat": None,
@@ -241,18 +286,19 @@ def analyze(frame: np.ndarray, flat: dict) -> dict:
 
     # ── 1段目: 果実検出用HSVマスク ─────────────────────────────
     mask1 = mask_from_hsv(hsv, mask_params(flat))
-    res["mask1"] = res["mask_reflect"] = res["mask_final"] = mask1
+    res["mask1"] = res["mask_reflect"] = res["mask_final"] = _to_native_mask(mask1, h, w)
 
     n1, labels1, stats1, cents1 = cv2.connectedComponentsWithStats(mask1)
     if n1 <= 1:
         return res
 
     idx = int(np.argmax(stats1[1:, cv2.CC_STAT_AREA])) + 1
-    min_area = int(flat["min_blob_area"])
+    # min_blob_area はネイティブpx^2基準の設定値。縮小画像の画素数に合わせ面積比(scale^2)で換算する（本番と同じ）。
+    min_area = int(flat["min_blob_area"] * scale * scale)
     if stats1[idx, cv2.CC_STAT_AREA] < min_area:
         res["status"] = "too_small"
-        res["area"]   = int(stats1[idx, cv2.CC_STAT_AREA])
-        res["stat"]   = stats1[idx]
+        res["stat"]   = _native_stat(stats1[idx], inv)
+        res["area"]   = int(res["stat"][cv2.CC_STAT_AREA])
         return res
 
     # 2段目（整形）が必要かの判定は _load_hsv_config の _refine と同じ規則
@@ -261,34 +307,37 @@ def analyze(frame: np.ndarray, flat: dict) -> dict:
     refine   = bool(flat["stem_open"] > 0 or s_active or v_active)
 
     if not refine:
-        s = stats1[idx]
-        res["area"] = int(s[cv2.CC_STAT_AREA])
-        res["stat"] = s
-        if _touches_edge(s, w, h):
+        stat_native = _native_stat(stats1[idx], inv)
+        res["area"] = int(stat_native[cv2.CC_STAT_AREA])
+        res["stat"] = stat_native
+        if _touches_edge(stat_native, w, h):
             res["status"] = "edge"
             return res
-        res.update(status="ok", labels=labels1, max_index=idx,
-                   mx=int(cents1[idx][0]), my=int(cents1[idx][1]))
-        res["in_band"] = _check_band(res["mx"], w, window_half_px(flat["fruit_speed_px"]))
+        mx = int(round(cents1[idx][0] * inv))
+        my = int(round(cents1[idx][1] * inv))
+        res.update(status="ok", labels=labels1, max_index=idx, mx=mx, my=my)
+        res["in_band"] = _check_band(mx, w, window_half_px(flat["fruit_speed_px"]))
         return res
 
-    # ── 2段目: 候補ブロブ周辺だけを切り出して整形する ──────────
-    pad = max(int(flat["stem_open"]), 4) + 1
+    # ── 2段目: 候補ブロブ周辺だけを切り出して整形する（縮小画像の座標系のまま処理）──
+    # stem_open はネイティブpx基準の半径なので、縮小画像上ではscale倍して使う（本番と同じ）。
+    stem_open_scaled = max(0, int(round(flat["stem_open"] * scale)))
+    pad = max(stem_open_scaled, 4) + 1
     bx, by = int(stats1[idx, cv2.CC_STAT_LEFT]),  int(stats1[idx, cv2.CC_STAT_TOP])
     bw, bh = int(stats1[idx, cv2.CC_STAT_WIDTH]), int(stats1[idx, cv2.CC_STAT_HEIGHT])
-    x0, y0 = max(0, bx - pad),      max(0, by - pad)
-    x1, y1 = min(w, bx + bw + pad), min(h, by + bh + pad)
+    x0, y0 = max(0, bx - pad),       max(0, by - pad)
+    x1, y1 = min(dw, bx + bw + pad), min(dh, by + bh + pad)
 
     sub = mask1[y0:y1, x0:x1]
     sub_r = remove_reflection_sat(
         sub, hsv[y0:y1, x0:x1, 1], hsv[y0:y1, x0:x1, 2],
         flat["reflect_sat_lo"], flat["reflect_sat_hi"],
         flat["reflect_v_lo"],   flat["reflect_v_hi"])
-    sub_s = remove_stem(sub_r, int(flat["stem_open"]))
+    sub_s = remove_stem(sub_r, stem_open_scaled)
 
-    # 表示用: 切り出し範囲外は黒（本番でも範囲外のブロブは捨てられる）
-    res["mask_reflect"] = _paste(sub_r, h, w, x0, y0)
-    res["mask_final"]   = _paste(sub_s, h, w, x0, y0)
+    # 表示用: 切り出し範囲外は黒（本番でも範囲外のブロブは捨てられる）。ネイティブ解像度へ戻す。
+    res["mask_reflect"] = _to_native_mask(_paste(sub_r, dh, dw, x0, y0), h, w)
+    res["mask_final"]   = _to_native_mask(_paste(sub_s, dh, dw, x0, y0), h, w)
 
     n2, lab2, st2, ce2 = cv2.connectedComponentsWithStats(sub_s)
     if n2 <= 1:
@@ -296,24 +345,49 @@ def analyze(frame: np.ndarray, flat: dict) -> dict:
 
     j  = int(np.argmax(st2[1:, cv2.CC_STAT_AREA])) + 1
     s2 = st2[j].copy()
-    res["area"] = int(s2[cv2.CC_STAT_AREA])
+    if s2[cv2.CC_STAT_AREA] < min_area:
+        s2[cv2.CC_STAT_LEFT] += x0
+        s2[cv2.CC_STAT_TOP]  += y0
+        res["status"] = "too_small"
+        res["stat"]   = _native_stat(s2, inv)
+        res["area"]   = int(res["stat"][cv2.CC_STAT_AREA])
+        return res
+
     s2[cv2.CC_STAT_LEFT] += x0
     s2[cv2.CC_STAT_TOP]  += y0
-    res["stat"] = s2
+    stat_native = _native_stat(s2, inv)
+    res["area"] = int(stat_native[cv2.CC_STAT_AREA])
+    res["stat"] = stat_native
 
-    if res["area"] < min_area:
-        res["status"] = "too_small"
-        return res
-    if _touches_edge(s2, w, h):
+    if _touches_edge(stat_native, w, h):
         res["status"] = "edge"
         return res
 
-    labels_full = np.zeros((h, w), dtype=np.int32)
+    labels_full = np.zeros((dh, dw), dtype=np.int32)
     labels_full[y0:y1, x0:x1] = (lab2 == j)
-    res.update(status="ok", labels=labels_full, max_index=1,
-               mx=int(ce2[j][0]) + x0, my=int(ce2[j][1]) + y0)
-    res["in_band"] = _check_band(res["mx"], w, window_half_px(flat["fruit_speed_px"]))
+    mx = int(round((ce2[j][0] + x0) * inv))
+    my = int(round((ce2[j][1] + y0) * inv))
+    res.update(status="ok", labels=labels_full, max_index=1, mx=mx, my=my)
+    res["in_band"] = _check_band(mx, w, window_half_px(flat["fruit_speed_px"]))
     return res
+
+
+def _native_stat(stat, inv: float) -> np.ndarray:
+    """縮小画像上の cv2 stats 行(LEFT/TOP/WIDTH/HEIGHT/AREA)をネイティブ座標系へ復元する。"""
+    return np.array([
+        int(round(stat[cv2.CC_STAT_LEFT]   * inv)),
+        int(round(stat[cv2.CC_STAT_TOP]    * inv)),
+        int(round(stat[cv2.CC_STAT_WIDTH]  * inv)),
+        int(round(stat[cv2.CC_STAT_HEIGHT] * inv)),
+        int(round(stat[cv2.CC_STAT_AREA]   * inv * inv)),
+    ])
+
+
+def _to_native_mask(mask: np.ndarray, h: int, w: int) -> np.ndarray:
+    """縮小画像上で計算したマスクを表示用にネイティブ解像度へ戻す（最近傍補間でブロック感を保つ）。"""
+    if mask.shape[0] == h and mask.shape[1] == w:
+        return mask
+    return cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
 def _paste(sub: np.ndarray, h: int, w: int, x0: int, y0: int) -> np.ndarray:
@@ -612,7 +686,11 @@ class TunerWindow(QMainWindow):
         self._threads: dict[str, CameraThread] = {}
         self._previews: dict[str, QLabel] = {}
         self._infos: dict[str, QLabel] = {}
+        self._sources: dict[str, QLabel] = {}
         self._panels: dict[str, ParamPanel] = {}
+        # cam_name -> 静止画のBGR配列。None ならライブ映像を使う。
+        self._static_frames: dict[str, np.ndarray | None] = {}
+        self._detect_scale = DEFAULT_DETECT_SCALE
 
         self._build_ui()
         self._start_cameras()
@@ -639,6 +717,24 @@ class TunerWindow(QMainWindow):
         self._mode.addItems(VIEW_MODES)
         self._mode.setFixedWidth(160)
         mode_row.addWidget(self._mode)
+
+        mode_row.addSpacing(20)
+        mode_row.addWidget(QLabel("検出縮小率:"))
+        self._scale_slider = QSlider(Qt.Horizontal)
+        self._scale_slider.setRange(SCALE_MIN_PCT, SCALE_MAX_PCT)
+        self._scale_slider.setFixedWidth(140)
+        self._scale_slider.setValue(int(round(DEFAULT_DETECT_SCALE * 100)))
+        self._scale_slider.setToolTip(
+            "module_yolo.HSV_DETECT_SCALE 相当（全カメラ共通・1つの値）。\n"
+            "HSV変換以降をこの倍率に縮小した画像で処理し、結果はネイティブ座標へ復元する。\n"
+            "1.0で無効（ネイティブ解像度のまま）。下げるほど高速化するが検出精度が落ちる。\n"
+            "このツールの値はJSONに保存されない。採用する値は module_yolo.HSV_DETECT_SCALE へ手動反映すること。")
+        self._scale_label = QLabel(f"{DEFAULT_DETECT_SCALE:.2f}")
+        self._scale_label.setFixedWidth(40)
+        self._scale_slider.valueChanged.connect(self._on_scale_changed)
+        mode_row.addWidget(self._scale_slider)
+        mode_row.addWidget(self._scale_label)
+
         mode_row.addStretch()
         left.addLayout(mode_row)
 
@@ -684,6 +780,27 @@ class TunerWindow(QMainWindow):
         preview.setStyleSheet("background:#1a1a1a;")
         v.addWidget(preview)
 
+        src_row = QHBoxLayout()
+        src_row.setSpacing(3)
+        btn_open = QPushButton("画像を開く")
+        btn_open.setFixedHeight(24)
+        btn_open.setToolTip(
+            "静止画ファイルを読み込み、以後このカメラはライブ映像の代わりに\n"
+            "この画像でスライダー調整のプレビューを行う。")
+        btn_open.clicked.connect(lambda _checked, c=cam_name: self._open_static_image(c))
+        btn_live = QPushButton("ライブに戻す")
+        btn_live.setFixedHeight(24)
+        btn_live.clicked.connect(lambda _checked, c=cam_name: self._use_live(c))
+        src_row.addWidget(btn_open)
+        src_row.addWidget(btn_live)
+        v.addLayout(src_row)
+
+        source = QLabel("ソース: ライブ映像")
+        source.setAlignment(Qt.AlignCenter)
+        source.setWordWrap(True)
+        source.setStyleSheet("font-size:11px; color:#888888;")
+        v.addWidget(source)
+
         info = QLabel("接続待ち...")
         info.setAlignment(Qt.AlignCenter)
         info.setFixedHeight(36)
@@ -692,7 +809,38 @@ class TunerWindow(QMainWindow):
 
         self._previews[cam_name] = preview
         self._infos[cam_name] = info
+        self._sources[cam_name] = source
         return grp
+
+    # --------------------------------------------------
+    def _open_static_image(self, cam_name: str):
+        """静止画ファイルを選び、以後このカメラのプレビュー・解析をその画像で行う。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"{cam_name} の静止画像を選択", "",
+            "画像ファイル (*.jpg *.jpeg *.png *.bmp);;すべてのファイル (*.*)")
+        if not path:
+            return
+
+        img = imread_ja(path)
+        if img is None:
+            self._sources[cam_name].setText(f"読込失敗: {os.path.basename(path)}")
+            self._sources[cam_name].setStyleSheet("font-size:11px; color:#cc4444;")
+            return
+
+        # データセット画像(640x640等)はネイティブ解像度基準の閾値とズレるため、
+        #   verify_hsv_detect_scale_real.py と同じ規則でネイティブ解像度へ合わせる。
+        native = NATIVE_SIZE.get(cam_name)
+        if native and (img.shape[0] != native or img.shape[1] != native):
+            img = cv2.resize(img, (native, native), interpolation=cv2.INTER_AREA)
+
+        self._static_frames[cam_name] = img
+        self._sources[cam_name].setText(f"静止画: {os.path.basename(path)}")
+        self._sources[cam_name].setStyleSheet("font-size:11px; color:#0077cc; font-weight:bold;")
+
+    def _use_live(self, cam_name: str):
+        self._static_frames[cam_name] = None
+        self._sources[cam_name].setText("ソース: ライブ映像")
+        self._sources[cam_name].setStyleSheet("font-size:11px; color:#888888;")
 
     # --------------------------------------------------
     def _start_cameras(self):
@@ -703,25 +851,35 @@ class TunerWindow(QMainWindow):
         self._sb.showMessage("カメラ起動中（映像が表示されるまで少しお待ちください）")
 
     # --------------------------------------------------
+    def _on_scale_changed(self, value: int):
+        self._detect_scale = value / 100.0
+        self._scale_label.setText(f"{self._detect_scale:.2f}")
+
+    # --------------------------------------------------
     def _tick(self):
         mode = self._mode.currentText()
+        scale = self._detect_scale
         for cam_name, _, _ in GRID_LAYOUT:
-            thread = self._threads.get(cam_name)
             info = self._infos[cam_name]
-            if thread is None:
-                continue
 
-            frame = thread.get_frame()
-            if frame is None:
-                if thread.error:
-                    info.setText(f"接続エラー\n{thread.error}")
-                    info.setStyleSheet("color:#cc4444; font-size:11px;")
-                continue
+            static_frame = self._static_frames.get(cam_name)
+            if static_frame is not None:
+                frame = static_frame
+            else:
+                thread = self._threads.get(cam_name)
+                if thread is None:
+                    continue
+                frame = thread.get_frame()
+                if frame is None:
+                    if thread.error:
+                        info.setText(f"接続エラー\n{thread.error}")
+                        info.setStyleSheet("color:#cc4444; font-size:11px;")
+                    continue
 
             panel = self._panels[cam_name]
             panel.set_roi_width(frame.shape[1])
             try:
-                res = analyze(frame, panel.get_flat())
+                res = analyze(frame, panel.get_flat(), scale)
                 view = render(frame, res, panel.get_flat(), mode)
             except Exception as e:
                 # 1台の処理失敗で全体を止めない

@@ -68,7 +68,7 @@ CENTER_THRESHOLD_X = 100
 #   詳細: docs/findings_20260722_jetson_verdict.md §6
 #   0.5も試したが検出漏れが2.9〜3.3%まで増える一方、必要な削減幅(目安2.7倍)に対しては
 #   オーバースペックだったため見送り。検証スクリプト: standalone/verify_hsv_detect_scale_real.py
-HSV_DETECT_SCALE = 0.7
+HSV_DETECT_SCALE = 0.5
 
 # ================================================
 # 推論ゲート（中心窓）設定
