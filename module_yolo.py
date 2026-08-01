@@ -301,7 +301,8 @@ class ImageProcessor:
             s = stats[idx]
             bx = int(round(s[0] * inv)); by = int(round(s[1] * inv))
             bw = int(round(s[2] * inv)); bh = int(round(s[3] * inv))
-            if (bx <= 5) or (by <= 5) or ((bx + bw) >= (w - 5)) or ((by + bh) >= (h - 5)):
+            # 左右端接触のみ棄却（上下端は許容）
+            if (bx <= 5) or ((bx + bw) >= (w - 5)):
                 return None
             area_native = int(round(s[4] * inv * inv))
             return {'mx': int(round(centroids[idx][0] * inv)),
@@ -349,8 +350,8 @@ class ImageProcessor:
         width_native  = int(round(s2[cv2.CC_STAT_WIDTH]  * inv))
         height_native = int(round(s2[cv2.CC_STAT_HEIGHT] * inv))
         area_native   = int(round(s2[cv2.CC_STAT_AREA] * inv * inv))
-        if (left_native <= 5) or (top_native <= 5) or \
-           ((left_native + width_native) >= (w - 5)) or ((top_native + height_native) >= (h - 5)):
+        # 左右端接触のみ棄却（上下端は許容）
+        if (left_native <= 5) or ((left_native + width_native) >= (w - 5)):
             return None
 
         # 帯ゲートは labels[:, x] == max_index で全画面を走査する想定の実装だが、

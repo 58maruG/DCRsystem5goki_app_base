@@ -397,9 +397,8 @@ def _paste(sub: np.ndarray, h: int, w: int, x0: int, y0: int) -> np.ndarray:
 
 
 def _touches_edge(stat, w: int, h: int) -> bool:
-    return bool(stat[0] <= EDGE_MARGIN or stat[1] <= EDGE_MARGIN
-                or (stat[0] + stat[2]) >= (w - EDGE_MARGIN)
-                or (stat[1] + stat[3]) >= (h - EDGE_MARGIN))
+    # 左右端接触のみ棄却（上下端は許容。module_yolo.get_target_info と同じ規則）
+    return bool(stat[0] <= EDGE_MARGIN or (stat[0] + stat[2]) >= (w - EDGE_MARGIN))
 
 
 def band_lines(w: int, half: int) -> tuple[int, int]:
