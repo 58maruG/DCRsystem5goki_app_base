@@ -26,6 +26,6 @@
     "reflect_v_hi": 255,
     "stem_open": 20,
     "roi_width_at_tuning": 560,
-    "min_blob_area": 25000,
+    "min_blob_area": 15000,
     "fruit_speed_px": 60
 }
