@@ -777,22 +777,25 @@ class MainWindow(module_gui_JP.MainWindowUI):
             **_hw,
         )
 
-    # --- クラス→表示名・リレー先を判定する（健全果のみ運搬、それ以外は除去）---
-    #   表示名と色は module_gui_JP.CLASS_DISPLAY に一元化している。
-    def _resolve_channel(self, disease_name):
+    # --- リレー先を判定する（健全果のみ運搬、それ以外は除去）---
+    #   健全/障害の判定は result_obj.is_damaged（module_yolo._resolve_quality が確定）で行う。
+    #   label_name の "healthy" 一致では判定しないこと（複数カメラでの健全確証が無い場合、
+    #   label_name="healthy" でも is_damaged=True になりうるため）。
+    #   表示名は module_gui_JP.CLASS_DISPLAY に一元化している。
+    def _resolve_channel(self, result_obj):
+        disease_name = result_obj.label_name
         info = module_gui_JP.CLASS_DISPLAY.get(disease_name)
-        if info is not None:
-            channel = (r_ctr.RelayChannel.TRANSPORT
-                       if disease_name == "healthy"
-                       else r_ctr.RelayChannel.REMOVE)
-            return channel, info["jp"]
+        if info is None:
+            # CLASS_DISPLAY 未登録クラス（モデルに新クラスが増えた等）。
+            #   無言で排出されず・IDだけ欠番になる(=ID飛び)のを防ぐため、
+            #   不良として除去し、英語ラベルのまま表示・警告ログを残す。
+            log.warning("未登録クラス '%s' を検出。不良として除去します。CLASS_DISPLAYへの登録を推奨。",
+                        disease_name)
+            return r_ctr.RelayChannel.REMOVE, disease_name
 
-        # CLASS_DISPLAY 未登録クラス（モデルに新クラスが増えた等）。
-        #   無言で排出されず・IDだけ欠番になる(=ID飛び)のを防ぐため、
-        #   不良として除去し、英語ラベルのまま表示・警告ログを残す。
-        log.warning("未登録クラス '%s' を検出。不良として除去します。CLASS_DISPLAYへの登録を推奨。",
-                    disease_name)
-        return r_ctr.RelayChannel.REMOVE, disease_name
+        # is_damaged が未確定(None)の場合も安全側でREMOVE扱いにする（通常は到達しない）。
+        channel = r_ctr.RelayChannel.TRANSPORT if result_obj.is_damaged is False else r_ctr.RelayChannel.REMOVE
+        return channel, info["jp"]
 
     # --- cycle ログ1行目（確定直後に書けるデータ）を記録する ---
     #   eject_decision: 除去(REMOVE)=1 / 健全運搬(TRANSPORT)=0
@@ -860,7 +863,7 @@ class MainWindow(module_gui_JP.MainWindowUI):
         if disease_name in self.detection_counts:
             self.detection_counts[disease_name] += 1
 
-        channel, display_name = self._resolve_channel(disease_name)
+        channel, display_name = self._resolve_channel(result_obj)
 
         if channel is not None:
             # リレー制御 + 排出ログ（バックグラウンドで実行し、完了後に cycle 補完行を書く）

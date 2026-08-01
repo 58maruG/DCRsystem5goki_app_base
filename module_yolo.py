@@ -96,30 +96,12 @@ YOLO_IMG_SIZE = 640
 CONF_THRESHOLD = 0.5
 
 # ================================================
-# クラス別信頼度閾値
+# 健全/障害 二値判定設定
 # ================================================
-# strict閾値:不良として採用する最小信頼度
-# 取りこぼしが気になる場合はさらに下げ、良品の誤排出が増える場合は上げる。
-# クラス別 strict 閾値。判定ロジックの全段階と GUI表示フィルタ(class_breakdown)で共用する。
-#   ここに無いクラス(カビ・灰星病など)は閾値なし＝常に採用・表示。
-STRICT_THRESHOLDS = {
-    "stemcrack":    0.8,
-    "crack":        0.8,
-    "birddamage":   0.8,
-    "twin":         0.9,
-    "blacktwin":    0.9,
-    "malformation": 0.9,
-    "unripe":       0.9,
-}
-
-# ================================================
-# マルチカメラ確定ロジック設定
-# ================================================
-# twin/malformation/blacktwin: この台数以上の「異なるカメラ」で検出されたら、
-#   全体の最大信頼度によらずそのクラスを確定する（同一カメラの複数フレームは1カウント）。
-MULTI_CAM_MIN = 2
-# unripe を確定するのに必要なカメラ台数
-UNRIPE_MIN_CAMS = 3
+# 健全と判定するために必要な、異なるカメラでの healthy 検出台数（同一カメラの複数フレームは1カウント）。
+#   障害系クラス（unripeを含む）は1カメラ・1検出でも即座に障害と判定する（低いハードル）。
+#   健全と判定するには複数カメラでの一致を要求し、見落とし（偽健全）を防ぐ（高いハードル）。
+HEALTHY_CONFIRM_MIN_CAMS = 2
 
 # ================================================
 # セグメンテーション（個体区切り）設定
@@ -176,6 +158,12 @@ class YoloResult:
         self.label_name   = label_name
         self.confidence   = confidence
         self.cam_name     = cam_name
+
+        # 健全/障害の二値判定結果（_resolve_quality が確定時に設定）。
+        #   True=障害（除去） / False=健全（運搬） / None=未確定。
+        #   仕分け判定は必ずこちらを見る。label_name の "healthy" 一致では判定しないこと
+        #   （複数カメラでの健全確証が無い場合、label_name="healthy" でも is_damaged=True になりうる）。
+        self.is_damaged: bool | None = None
 
         # 個体確定時に _finalize_object が付与するサイクル集計（cycle ログ用）。
         # 既定値を持たせ、未確定の中間結果でも属性参照で落ちないようにする。
@@ -514,7 +502,7 @@ class YoloDetector:
             confirmed   = self.obj_has_detection or (visible_dur >= self.MIN_VISIBLE_SEC)
             if confirmed:
                 if self.obj_detections:
-                    best = self._resolve_best_result(self.obj_detections)
+                    best = self._resolve_quality(self.obj_detections)
                     if best:
                         # long形式CSV: このIDの全検出をクラス別に集約して書き出す。
                         self.logger.write_csv(best.id, self.obj_detections, best.label_name)
@@ -560,13 +548,7 @@ class YoloDetector:
             if d.label_name not in by_class or d.confidence > by_class[d.label_name]:
                 by_class[d.label_name] = d.confidence
         breakdown = sorted(by_class.items(), key=lambda kv: kv[1], reverse=True)
-        # strict閾値未満のクラスはGUIに表示しない。ただし確定クラス(best.label_name)は
-        #   閾値に関わらず残す（有効検出ゼロ時に検出信頼度で確定したクラスを消さないため）。
-        #   閾値の無いクラス(カビ・灰星病など)は従来どおり常に表示。
-        best.class_breakdown = [
-            (lbl, conf) for lbl, conf in breakdown
-            if lbl == best.label_name or conf >= STRICT_THRESHOLDS.get(lbl, 0.0)
-        ]
+        best.class_breakdown = breakdown
 
         # カメラ別の検出内訳を集計する（GUIのカメラ別列用）。
         #   各カメラについて {クラス: そのカメラでの最大信頼度} を作り、そこから
@@ -574,7 +556,6 @@ class YoloDetector:
         #     final_conf … 確定クラス(best.label_name)をそのカメラが検出していれば信頼度、無ければ None
         #   を取り出す。GUIは final_conf があれば「◎確定クラス」を優先表示し（そのカメラの
         #   最高信頼度クラスでなくても）、無ければ top を、検出ゼロなら "-" を出す。
-        #   obj_detections は蓄積時点で STRICT_THRESHOLDS 通過済みのため追加のしきい値判定は不要。
         final_label = best.label_name
         cam_class_max: dict[str, dict[str, float]] = {}
         for d in self.obj_detections:
@@ -640,81 +621,35 @@ class YoloDetector:
             best.visible_dur_s = round(visible_dur, 3)
         best.cycle_dur_s = round(time.monotonic() - self._cycle_started_at, 3)
 
-    def _resolve_best_result(self, detections: list) -> YoloResult | None:
+    def _resolve_quality(self, detections: list) -> YoloResult | None:
         """
-        全カメラの履歴から最終判定を決定する。
-        受け取る detections は蓄積時点で STRICT_THRESHOLDS 済み。
+        全カメラの履歴から健全/障害の二値判定（is_damaged）を行い、判定の根拠となった
+        検出（最も信頼度が高いもの）を返す。label_name には引き続き具体的なクラス名が入るが、
+        仕分け（リレー制御・GUI集計）に使うのは is_damaged の方であり、label_name 単体
+        （"healthy" かどうか）では判定しない。
 
-        (1) 「複数カメラ一致による確定ルール」を判定する。
-            MULTI_CAM_MIN 台以上で成立すれば、そのクラスを確定する。
-        (2) 成立しなければフォールバックで決める。優先順は
-            「不良(未熟含む) > 健全」。ただし残りが未熟と健全のみの場合は
-            検出カメラ数の過半数で決め、同数なら信頼度が高い方を採用する。
+        障害判定（低いハードル）: healthy 以外のクラス（unripe を含む）が1件でも
+          検出されていれば、カメラ台数によらず即座に障害と判定する。表示・ログ用の
+          ラベルは、障害系検出のうち最も信頼度が高いものを採用する。
+        健全判定（高いハードル）: 障害系検出が皆無で、かつ HEALTHY_CONFIRM_MIN_CAMS 台以上の
+          異なるカメラで healthy が検出された場合のみ健全と判定する。条件を満たさない
+          場合は見落とし（偽健全）を避けるため、安全側で障害として扱う。
         """
         if not detections:
             return None
 
-        # --- クラスごとに「検出した異なるカメラ数」を集計（同一カメラの複数フレームは1カウント）---
-        cams_per_label: dict[str, set] = {}
-        for d in detections:
-            cams_per_label.setdefault(d.label_name, set()).add(d.cam_name)
+        damage_list = [d for d in detections if d.label_name != "healthy"]
+        if damage_list:
+            best = max(damage_list, key=lambda x: x.confidence)
+            best.is_damaged = True
+            return best
 
-        def cam_count(label: str) -> int:
-            return len(cams_per_label.get(label, ()))
-
-        def best_of(label: str) -> YoloResult | None:
-            cands = [d for d in detections if d.label_name == label]
-            return max(cands, key=lambda x: x.confidence) if cands else None
-
-        # ============================================================
-        # (1) 確定ルール: 指定クラスが複数カメラ(閾値以上)で検出されたら確定
-        # ============================================================
-        # twin / malformation / blacktwin: MULTI_CAM_MIN 台以上の異なるカメラで検出 → 確定。
-        confirmed = [best_of(lbl) for lbl in ("twin", "malformation", "blacktwin")
-                     if cam_count(lbl) >= MULTI_CAM_MIN]
-        if confirmed:
-            return max(confirmed, key=lambda x: x.confidence)
-
-        # unripe: UNRIPE_MIN_CAMS 台以上で確定
-        if cam_count("unripe") >= UNRIPE_MIN_CAMS:
-            return best_of("unripe")
-
-        # ============================================================
-        # (2) フォールバック: 確定ルール非成立時は最大信頼度ベースで決める
-        # ============================================================
-        #   detections は既に閾値以上のみなので、ここでの個別閾値チェックは不要。
-        #   未熟・健全以外は全て「不良(other_damaged)」として扱う。
-        healthy_list       = [d for d in detections if d.label_name == "healthy"]
-        unripe_list        = [d for d in detections if d.label_name == "unripe"]
-        other_damaged_list = [d for d in detections
-                              if d.label_name not in ("healthy", "unripe")]
-
-        # ------------------------------------------------------------
-        # 優先順位の決定: 不良(未熟含む) > 健全
-        #   1. 未熟以外の不良があれば最優先（最高信頼度）。
-        #   2. 残りが未熟と健全のみなら、検出した異なるカメラ数の多い方（過半数）を採用。
-        #      同数なら信頼度が高い方を採用する。
-        # ------------------------------------------------------------
-        if other_damaged_list:
-            return max(other_damaged_list, key=lambda x: x.confidence)
-
-        best_unripe  = max(unripe_list,   key=lambda x: x.confidence) if unripe_list  else None
-        best_healthy = max(healthy_list,  key=lambda x: x.confidence) if healthy_list else None
-        if best_unripe and best_healthy:
-            unripe_cams  = len({d.cam_name for d in unripe_list})
-            healthy_cams = len({d.cam_name for d in healthy_list})
-            if unripe_cams != healthy_cams:
-                return best_unripe if unripe_cams > healthy_cams else best_healthy
-            # 同数 → 信頼度が高い方を採用
-            return best_unripe if best_unripe.confidence >= best_healthy.confidence else best_healthy
-        if best_unripe:
-            return best_unripe
-        if best_healthy:
-            return best_healthy
-
-        # ガード: ここに到達するのは other_damaged/unripe/healthy が全て空のときだが、
-        #   detections は閾値以上の非空リストなので通常は手前で return される。
-        return max(detections, key=lambda x: x.confidence)
+        # ここに到達するのは healthy のみが検出されているケース。
+        healthy_list = detections
+        best = max(healthy_list, key=lambda x: x.confidence)
+        healthy_cams = len({d.cam_name for d in healthy_list})
+        best.is_damaged = healthy_cams < HEALTHY_CONFIRM_MIN_CAMS
+        return best
 
     # ------------------------------------------------------
     # 運転状態・ワーカー制御
@@ -935,8 +870,7 @@ class YoloDetector:
                 entry['label'] = best_result.label_name
 
         # obj_detections への蓄積
-        if best_result.label_name != "None" and \
-           best_result.confidence >= STRICT_THRESHOLDS.get(best_result.label_name, 0.0):
+        if best_result.label_name != "None":
             self.obj_detections.append(best_result)
             self.obj_has_detection = True
 
