@@ -158,7 +158,7 @@ wheels = [
 ]
 
 [[package]]
-name = "dcrsystem5goki-pc-app-base"
+name = "dcrsystem5goki-app-base"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

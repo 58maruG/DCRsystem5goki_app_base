@@ -1,41 +1,35 @@
-"""本番（main.py）を動かしたまま Task 1〜3 を同時に計測するプローブ。
+"""本番（main.py）を動かしたまま、実効並列度・実クロック・HSV処理時間を同時に計測するプローブ。
 
 run_as_jetson.py から使う。単体で import しても副作用は無い。
 
 ──────────────────────────────────────────────────────────────
 何をどう測るか
 ──────────────────────────────────────────────────────────────
-Task 1  実効並列度
+CPU（実効並列度）
     プロセス自身を psutil で1秒ごとにサンプリングする。スレッドIDを
     threading.enumerate() の native_id と突き合わせるので、
     「cam-worker-cam_top が何%使っているか」まで名前付きで出る。
 
-Task 2  HSV検出の実処理時間
+クロック（実効クロック）
+    Windows の `% Processor Performance` カウンタを PowerShell 越しに継続ポーリングする。
+    powercfg PROCTHROTTLEMAX は自己申告（run_as_jetson.py の clock.applied）だけでは
+    「本当にそのクロックまで落ちたか」を保証しないため、実行中ずっと直接実測する
+    （旧 verify_clock_throttle.ps1 の手動検証をこのプローブに統合した）。
+
+HSV検出の実処理時間
     ImageProcessor.get_target_info をラップして、本番が実際に呼んだ回数・時間を
     カメラ別に積む。マイクロベンチと違い、GUI・推論・カメラ取得と競合した
     「実際の条件下」の値になる。1個体あたりの合計は本番が既に
     logs_cycle_5goki/*.csv へ書いているので、そちらを analyze_cycle_logs.py で読む。
-
-Task 3  半解像度化の検出劣化
-    サンプリング窓の間だけ、本番が処理したのと同じフレームを検証スレッドへ渡し、
-    **独立コピーの module_yolo（縮小率1.0固定）** で基準側を計算して突き合わせる。
-    グローバル差し替えを使わないので本番の処理に干渉しない（jetson_probe_common
-    .load_reference_module の説明を参照）。
-
-──────────────────────────────────────────────────────────────
-計測が計測対象を変えてしまう点について
-──────────────────────────────────────────────────────────────
-Task 3 の検証スレッドは全解像度HSVを走らせるので、その窓の間は CPU を余分に食う
-（PC実測で1フレームあたり8ms前後）。**Task 1/2 の数値をきれいに取りたい実行では
-Task 3 を切ること**。既定は「30秒検証 → 90秒休み」の間欠なので、休止中の区間だけを
-切り出せば Task 1/2 の値も汚れない（レポートに検証窓の時刻を残してある）。
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
-import queue
+import platform
+import subprocess
 import sys
 import threading
 import time
@@ -45,7 +39,7 @@ import jetson_probe_common as common  # noqa: E402
 
 
 # ==========================================================
-# Task 1: CPUサンプラ（プロセス内）
+# CPUサンプラ（プロセス内の実効並列度）
 # ==========================================================
 class CpuSampler:
     """自プロセスのCPU使用率・スレッド別内訳を一定間隔で記録する。"""
@@ -62,7 +56,7 @@ class CpuSampler:
         try:
             import psutil
         except ImportError:
-            print("[probe] psutil が無いため Task 1 の計測は行いません")
+            print("[probe] psutil が無いため CPU 計測は行いません")
             return False
         self._psutil = psutil
         self._t = threading.Thread(target=self._run, name="jetson-probe-cpu", daemon=True)
@@ -136,6 +130,7 @@ class CpuSampler:
             "cpu_percent_p95": p95,
             "cpu_percent_peak": max(s),
             "cores_equiv_p50": round(p50 / 100.0, 2),
+            "cores_equiv_p95": round(p95 / 100.0, 2),
             "cores_equiv_peak": round(max(s) / 100.0, 2),
             "threads_max": max(r.get("num_threads", 0) for r in self.rows),
             "threads_busy_max": max(r.get("threads_busy", 0) for r in self.rows),
@@ -146,49 +141,92 @@ class CpuSampler:
 
 
 # ==========================================================
-# Task 2 + 3: get_target_info のラッパ
+# クロックサンプラ（実効クロックの継続実測。Windows専用）
+# ==========================================================
+class ClockSampler:
+    """`% Processor Performance` カウンタを PowerShell 越しに継続ポーリングする。
+
+    powercfg PROCTHROTTLEMAX は「コマンドが通ったか」しか分からない自己申告値
+    （run_as_jetson.py の clock.applied）なので、Turbo Boost/Speed Shift 搭載の
+    CPU では狙った値まで落ちないことがある（実測で確認済み）。本サンプラは
+    実行中ずっとカウンタを直接読み、実効クロックを実測値として残す。
+    """
+
+    COUNTER = r"\Processor Information(_Total)\% Processor Performance"
+
+    def __init__(self, interval: float = 2.0):
+        self.interval = interval
+        self.samples: list[float] = []
+        self._stop = threading.Event()
+        self._t: threading.Thread | None = None
+
+    def start(self) -> bool:
+        if platform.system() != "Windows":
+            return False
+        self._t = threading.Thread(target=self._run, name="jetson-probe-clock", daemon=True)
+        self._t.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._t:
+            self._t.join(timeout=15.0)   # powershell.exe 起動中でも取りこぼさないよう長めに待つ
+
+    def _run(self) -> None:
+        cmd = ["powershell", "-NoProfile", "-Command",
+               f"(Get-Counter '{self.COUNTER}' -SampleInterval 1 -MaxSamples 1)"
+               ".CounterSamples.CookedValue"]
+        # powershell.exe の起動コスト自体が実測4〜6秒ある（Get-Counterの1秒待ちより支配的）。
+        # interval はあくまで「最短間隔」として扱い、実測にかかった時間ぶんは差し引く。
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15.0)
+                v = float(r.stdout.strip())
+                self.samples.append(v)
+            except (ValueError, subprocess.SubprocessError, OSError):
+                pass  # 1回の失敗でスキップ（管理者権限が無くても読めるカウンタだが念のため）
+            remaining = self.interval - (time.monotonic() - t0)
+            if self._stop.wait(max(0.0, remaining)):
+                break
+
+    def summary(self, base_mhz: float) -> dict:
+        """base_mhz: env_info() の cpu_freq_mhz.max（%はこの値に対する比率）。"""
+        if not self.samples or not base_mhz:
+            return {}
+        s = sorted(self.samples)
+        n = len(s)
+
+        def pct(p: float) -> float:
+            return s[min(n - 1, int(n * p))]
+
+        mean = sum(s) / n
+        return {
+            "n": n,
+            "base_mhz": base_mhz,
+            "pct_p50": round(pct(0.50), 1),
+            "pct_mean": round(mean, 1),
+            "pct_max": round(max(s), 1),
+            "effective_ghz_p50": round(base_mhz / 1000.0 * pct(0.50) / 100.0, 3),
+            "effective_ghz_mean": round(base_mhz / 1000.0 * mean / 100.0, 3),
+            "effective_ghz_max": round(base_mhz / 1000.0 * max(s) / 100.0, 3),
+        }
+
+
+# ==========================================================
+# HSV検出のラッパ（実処理時間の計測）
 # ==========================================================
 class HsvProbe:
-    """本番の HSV 検出をラップし、時間計測（Task 2）と縮小率比較（Task 3）を行う。"""
+    """本番の HSV 検出をラップし、実際に呼ばれた回数・時間をカメラ別に積む。"""
 
-    def __init__(self, verify: bool = False, ref_scale: float = 1.0,
-                 window_sec: float = 30.0, period_sec: float = 120.0,
-                 queue_size: int = 60):
-        self.verify = verify
-        self.ref_scale = ref_scale
-        self.window_sec = window_sec
-        self.period_sec = period_sec
-
+    def __init__(self):
         self.lock = threading.Lock()
         self.timings: dict[str, list] = {}      # cam → [ms, ...]
         self.calls: dict[str, int] = {}
         self.hits: dict[str, int] = {}
-
         self._orig = None
         self._module = None
-        self._ref_mod = None
-        self._q: queue.Queue = queue.Queue(maxsize=queue_size)
-        self._verify_thread: threading.Thread | None = None
-        self._stop = threading.Event()
 
-        # 検証窓の管理。窓ごとに連番を振り、キュー溢れがあった窓は遅延解析から外す
-        self._t0 = time.monotonic()
-        self._window_rows: dict[tuple, list] = {}    # (cam, window_id) → rows
-        self._window_drops: dict[int, int] = {}
-        self._windows: list[dict] = []
-
-    # ---------- 窓の判定 ----------
-    def _window_id(self) -> int | None:
-        """いま検証窓の中なら窓ID、外なら None。"""
-        if not self.verify:
-            return None
-        el = time.monotonic() - self._t0
-        cycle = int(el // self.period_sec)
-        if (el - cycle * self.period_sec) <= self.window_sec:
-            return cycle
-        return None
-
-    # ---------- インストール ----------
     def install(self) -> None:
         my = common.load_module_yolo()
         self._module = my
@@ -202,71 +240,20 @@ class HsvProbe:
             t0 = time.perf_counter()
             res = orig(frame, cam_name)
             dt = (time.perf_counter() - t0) * 1000.0
-
             with lock:
                 timings.setdefault(cam_name, []).append(dt)
                 calls[cam_name] = calls.get(cam_name, 0) + 1
                 if res is not None:
                     hits[cam_name] = hits.get(cam_name, 0) + 1
-
-            if self.verify:
-                wid = self._window_id()
-                if wid is not None:
-                    # frame は camera 側で毎フレーム新しく複製された配列で、
-                    # get_target_info も書き換えないため、参照を渡すだけでよい
-                    try:
-                        self._q.put_nowait((wid, cam_name, frame, res))
-                    except queue.Full:
-                        with lock:
-                            self._window_drops[wid] = self._window_drops.get(wid, 0) + 1
             return res
 
         # staticmethod として差し戻す（本番は ImageProcessor.get_target_info(...) で呼ぶ）
         my.ImageProcessor.get_target_info = staticmethod(wrapper)
 
-        if self.verify:
-            self._ref_mod = common.load_reference_module(self.ref_scale)
-            self._verify_thread = threading.Thread(
-                target=self._verify_loop, name="jetson-probe-verify", daemon=True)
-            self._verify_thread.start()
-            print(f"[probe] Task 3 検証を有効化（基準 scale={self.ref_scale} / "
-                  f"{self.window_sec:.0f}秒計測 → {self.period_sec:.0f}秒周期）")
-
     def uninstall(self) -> None:
         if self._module is not None and self._orig is not None:
             self._module.ImageProcessor.get_target_info = staticmethod(self._orig)
-        self._stop.set()
-        if self._verify_thread:
-            self._verify_thread.join(timeout=5.0)
 
-    # ---------- 検証スレッド ----------
-    def _verify_loop(self) -> None:
-        import verify_hsv_scale_video as v3      # make_row を共有する
-
-        while not self._stop.is_set():
-            try:
-                wid, cam, frame, prod_res = self._q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                ref_res = self._ref_mod.ImageProcessor.get_target_info(frame, cam)
-                w = frame.shape[1]
-                ref = self._to_row(ref_res, w, cam)
-                test = self._to_row(prod_res, w, cam)
-                key = (cam, wid)
-                rows = self._window_rows.setdefault(key, [])
-                rows.append(v3.make_row(len(rows), cam, ref, test))
-            except Exception as e:
-                print(f"[probe] 検証スレッド例外（計測のみ停止）: {type(e).__name__}: {e}")
-
-    @staticmethod
-    def _to_row(res, width: int, cam: str) -> dict:
-        if res is None:
-            return {"detected": False, "mx": None, "area": 0, "in_window": False}
-        return {"detected": True, "mx": int(res["mx"]), "area": int(res["area"]),
-                "in_window": common.in_infer_window(int(res["mx"]), width, cam)}
-
-    # ---------- 集計 ----------
     def timing_summary(self) -> dict:
         with self.lock:
             out = {}
@@ -279,65 +266,19 @@ class HsvProbe:
             total_p50 = sum(v["p50_ms"] for v in out.values() if "p50_ms" in v)
             return {"by_cam": out, "total_all_cams_p50_ms": round(total_p50, 3)}
 
-    def verify_summary(self, gap: int = 2) -> dict:
-        """窓ごとに集計する。キュー溢れのあった窓は連続性が壊れているので
-        遅延解析から外し、その旨を残す（黙って混ぜると遅延が過大に出る）。"""
-        if not self.verify:
-            return {}
-        import verify_hsv_scale_video as v3
-
-        by_cam: dict[str, dict] = {}
-        excluded = []
-        for (cam, wid), rows in sorted(self._window_rows.items()):
-            if self._window_drops.get(wid):
-                excluded.append({"cam": cam, "window": wid,
-                                 "dropped": self._window_drops[wid]})
-                continue
-            if len(rows) < 10:
-                continue
-            # 窓をまたぐと時系列が切れるので、窓ごとに集計してから件数で束ねる
-            by_cam.setdefault(cam, {"windows": [], "rows": []})
-            by_cam[cam]["windows"].append({"window": wid, "frames": len(rows),
-                                           "summary": v3.summarize(rows, gap)})
-            by_cam[cam]["rows"].extend(rows)
-
-        out = {"excluded_windows": excluded, "by_cam": {}}
-        for cam, d in by_cam.items():
-            # 窓ごとの結果を足し合わせた「通し」の集計も出す（個体数を稼ぐため）。
-            # フレーム番号は窓ごとに0始まりなので、境界で偽の個体が1件増えうる点に注意。
-            merged = v3.summarize(d["rows"], gap)
-            merged["windows"] = [{"window": w["window"], "frames": w["frames"],
-                                  "verdict": w["summary"].get("verdict")}
-                                 for w in d["windows"]]
-            merged["note"] = ("複数の検証窓を連結して集計している。窓の境界では"
-                              "時系列が不連続なため、個体数が窓の数だけ過大になりうる")
-            out["by_cam"][cam] = merged
-        return out
-
-    def rows_for_csv(self) -> list:
-        rows = []
-        for (cam, wid), rs in sorted(self._window_rows.items()):
-            for r in rs:
-                r = dict(r)
-                r["window"] = wid
-                rows.append(r)
-        return rows
-
 
 # ==========================================================
 # 全体をまとめる
 # ==========================================================
 class LiveProbeSet:
     def __init__(self, out_dir: str, tag: str, profile_cpu: bool = True,
-                 verify: bool = False, cpu_interval: float = 1.0,
-                 verify_window: float = 30.0, verify_period: float = 120.0,
-                 gap: int = 2):
+                 profile_clock: bool = True, cpu_interval: float = 1.0,
+                 clock_interval: float = 2.0):
         self.out_dir = out_dir
         self.tag = tag
-        self.gap = gap
         self.cpu = CpuSampler(cpu_interval) if profile_cpu else None
-        self.hsv = HsvProbe(verify=verify, window_sec=verify_window,
-                            period_sec=verify_period)
+        self.clock = ClockSampler(clock_interval) if profile_clock else None
+        self.hsv = HsvProbe()
         self.started_at = None
         self.ended_at = None
 
@@ -346,6 +287,10 @@ class LiveProbeSet:
         self.hsv.install()
         if self.cpu:
             self.cpu.start()
+        if self.clock:
+            ok = self.clock.start()
+            if not ok:
+                print("[probe] クロック実測は Windows 専用のためスキップします")
         print(f"[probe] 計測開始 tag={self.tag} → {self.out_dir}")
 
     def stop_and_report(self, extra: dict | None = None) -> dict:
@@ -353,7 +298,10 @@ class LiveProbeSet:
         self.hsv.uninstall()
         if self.cpu:
             self.cpu.stop()
+        if self.clock:
+            self.clock.stop()
 
+        env = common.env_info()
         result = {
             "tag": self.tag,
             "started_at": self.started_at,
@@ -363,18 +311,18 @@ class LiveProbeSet:
             "ended_at_iso": time.strftime("%Y-%m-%d %H:%M:%S",
                                           time.localtime(self.ended_at)),
             "duration_sec": round(self.ended_at - self.started_at, 1),
-            "env": common.env_info(),
-            "task2_hsv_timing": self.hsv.timing_summary(),
+            "env": env,
+            "hsv_timing": self.hsv.timing_summary(),
         }
         if extra:
             result.update(extra)
         if self.cpu:
-            result["task1_cpu"] = self.cpu.summary()
-            result["probe_overhead"] = self._overhead(result["task1_cpu"])
+            result["cpu_usage"] = self.cpu.summary()
+            result["probe_overhead"] = self._overhead(result["cpu_usage"])
             self._write_cpu_csv()
-        if self.hsv.verify:
-            result["task3_scale_verify"] = self.hsv.verify_summary(self.gap)
-            self._write_verify_csv()
+        if self.clock:
+            base_mhz = env.get("cpu_freq_mhz", {}).get("max", 0)
+            result["clock_measured"] = self.clock.summary(base_mhz)
 
         path = os.path.join(self.out_dir, f"{self.tag}_live_summary.json")
         common.write_json(path, result)
@@ -383,10 +331,9 @@ class LiveProbeSet:
         return result
 
     @staticmethod
-    def _overhead(task1: dict) -> dict:
-        """計測自身が使ったCPUの割合。Task 3 を有効にすると全解像度HSVを余分に走らせるので、
-        ここが大きい実行の Task 1/2 の数値はそのまま Jetson 換算に使えない。"""
-        by_thread = task1.get("cpu_sec_by_thread", {})
+    def _overhead(cpu_usage: dict) -> dict:
+        """計測プローブ自身が使ったCPUの割合。大きいとTask本体の数値が悪化して見える。"""
+        by_thread = cpu_usage.get("cpu_sec_by_thread", {})
         if not by_thread:
             return {}
         total = sum(by_thread.values())
@@ -395,16 +342,10 @@ class LiveProbeSet:
         out = {"probe_cpu_sec": round(probe, 2), "total_cpu_sec": round(total, 2),
                "probe_share": round(share, 4)}
         if share >= 0.10:
-            out["warning"] = (
-                f"計測プローブがCPU時間の {share:.0%} を使っている。"
-                "Task 1（実効並列度）と Task 2（HSV時間）の値はこの分だけ悪化しているため、"
-                "Jetson換算にはこの実行ではなく --no-profile-cpu を外した"
-                "「Task 3 無効（--verify-scale なし）」の実行を使うこと。"
-                "Task 3 の一致率・遅延の結論はこの影響を受けない（同じフレームを比べているため）")
+            out["warning"] = f"計測プローブがCPU時間の {share:.0%} を使っています。参考値として扱ってください。"
         return out
 
     def _write_cpu_csv(self) -> None:
-        import csv
         rows = [r for r in self.cpu.rows if "cpu_percent" in r]
         if not rows:
             return
@@ -420,18 +361,6 @@ class LiveProbeSet:
                 w.writerow(r)
         print(f"→ {path}")
 
-    def _write_verify_csv(self) -> None:
-        import csv
-        rows = self.hsv.rows_for_csv()
-        if not rows:
-            return
-        path = os.path.join(self.out_dir, f"{self.tag}_scale_frames.csv")
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
-        print(f"→ {path}")
-
     @staticmethod
     def _print_summary(r: dict) -> None:
         print("\n" + "=" * 78)
@@ -439,40 +368,31 @@ class LiveProbeSet:
               f"（{r['duration_sec']:.0f}秒）")
         print("=" * 78)
 
-        t1 = r.get("task1_cpu")
+        t1 = r.get("cpu_usage")
         if t1 and "error" not in t1:
-            print(f"\n[Task 1] CPU p50={t1['cpu_percent_p50']:.1f}% "
+            print(f"\n[CPU] p50={t1['cpu_percent_p50']:.1f}% "
                   f"({t1['cores_equiv_p50']:.2f}コア相当) / "
                   f"p95={t1['cpu_percent_p95']:.1f}% / "
                   f"peak={t1['cpu_percent_peak']:.1f}%")
-            print(f"          スレッド {t1['threads_max']} 本（稼働 {t1['threads_busy_max']} 本）"
+            print(f"      スレッド {t1['threads_max']} 本（稼働 {t1['threads_busy_max']} 本）"
                   f" / RSS ピーク {t1['rss_mb_peak']:.0f} MB")
-            print("          CPU時間の内訳[秒]:")
-            for name, sec in list(t1["cpu_sec_by_thread"].items())[:8]:
-                print(f"            {name:<28} {sec:8.1f}")
 
-        t2 = r.get("task2_hsv_timing", {})
+        ck = r.get("clock_measured")
+        if ck:
+            print(f"\n[クロック実測] 実効 {ck['effective_ghz_p50']:.2f}GHz（p50） "
+                  f"/ 平均 {ck['effective_ghz_mean']:.2f}GHz "
+                  f"/ 最大 {ck['effective_ghz_max']:.2f}GHz"
+                  f"（基準 {ck['base_mhz']/1000:.2f}GHz 比、n={ck['n']}）")
+
+        t2 = r.get("hsv_timing", {})
         if t2.get("by_cam"):
-            print(f"\n[Task 2] HSV検出（本番実行中の実測）")
+            print(f"\n[HSV検出] 本番実行中の実測")
             for cam, s in t2["by_cam"].items():
-                print(f"          {cam:<12} p50={s['p50_ms']:>6.2f}ms  "
+                print(f"      {cam:<12} p50={s['p50_ms']:>6.2f}ms  "
                       f"p95={s['p95_ms']:>6.2f}ms  {s['calls']:>6}回  "
                       f"検出率={s['detect_rate']:.0%}")
-            print(f"          4台合計 p50 = {t2['total_all_cams_p50_ms']:.2f} ms/フレーム")
-
-        t3 = r.get("task3_scale_verify", {})
-        if t3.get("by_cam"):
-            print(f"\n[Task 3] 縮小率の比較（基準1.0 vs 本番）")
-            for cam, s in t3["by_cam"].items():
-                ep = s.get("detect_episodes", {})
-                print(f"          {cam:<12} {s.get('verdict')}  "
-                      f"一致率={s.get('frame_agreement')}  "
-                      f"個体={ep.get('episodes')} 取りこぼし={ep.get('missed')} "
-                      f"遅延中央値={ep.get('delay_median')}")
-            if t3.get("excluded_windows"):
-                print(f"          ※ キュー溢れで除外した窓: {t3['excluded_windows']}")
+            print(f"      4台合計 p50 = {t2['total_all_cams_p50_ms']:.2f} ms/フレーム")
 
         ov = r.get("probe_overhead", {})
         if ov.get("warning"):
             print(f"\n[!] {ov['warning']}")
-            print(f"    プローブ {ov['probe_cpu_sec']}秒 / 全体 {ov['total_cpu_sec']}秒")
