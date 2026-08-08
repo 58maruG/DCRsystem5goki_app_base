@@ -12,12 +12,19 @@ wheels/
 # requirements files
 
 # Folder
-bench/
 analysis/
+bench/
 benio_analysis/
 evaluated_images/
 training_images/
 Trained_Models/
+
+# 生ログ（別途アーカイブ管理のためリポジトリでは追跡しない）
+logs/
+logs_cycle_5goki/
+logs_detections_5goki/
+logs_events_5goki/
+logs_health_5goki/
 
 # config files
 json/hsv_config.json

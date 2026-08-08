@@ -4,12 +4,28 @@
 #   黒タイル対策の統合設計版。判定ロジックを module_yolo（状態機械＋フレーム保持一本化）
 #   に差し替えただけで、その他は main_5goki_JP.py と同一。旧版はそのまま温存してある。
 # -------------------------------------------------
+import os
+
+# OpenMPのスレッドプールは共有ライブラリのロード時に確定するため、
+# cv2/torch を import するより前に設定する必要がある（JETSON_MIGRATION_NOTES.md §9）。
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+
 import sys
 
+import cv2
+import torch
 from PySide6.QtWidgets import QApplication
 
 import log_config
 from module_main_window_JP import StartupWindow
+
+# ネスト並列によるオーバーサブスクリプション防止（notes §9 の必須対策）。
+# ultralytics の import 副作用で cv2 は既に1になっているはずだが、バージョン依存の
+# 非公式挙動のため明示的に固定する。
+cv2.setNumThreads(1)
+torch.set_num_threads(2)
 
 log = log_config.get_logger("main")
 

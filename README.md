@@ -61,3 +61,4 @@ uv run main.py
 ## 補足ドキュメント
 
 - [JETSON_MIGRATION_NOTES.md](JETSON_MIGRATION_NOTES.md) — Jetson Orin Nano Super への移行検証メモ
+- [JETSON_VALIDATION_RUNBOOK.md](JETSON_VALIDATION_RUNBOOK.md) — 購入判断のための検証手順書（実験しながら見る用）

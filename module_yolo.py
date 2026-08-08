@@ -69,7 +69,6 @@ CENTER_THRESHOLD_X = 100
 #   詳細: docs/findings_20260722_jetson_verdict.md §6
 #   旧検証（2026-08-01時点のコードでは0.5は検出漏れ2.9〜3.3%）より大幅に改善しているのは、
 #   その後の「左右端接触のみ棄却」変更（上下端接触を許容するよう緩和）による効果とみられる。
-#   検証スクリプト: standalone/verify_hsv_detect_scale_real.py
 HSV_DETECT_SCALE = 0.5
 
 # ================================================
@@ -93,7 +92,9 @@ def infer_window_px(cam_name: str) -> int:
     return max(1, int(round(speed * INFER_FRAMES_PER_CAM / 2.0)))
 
 #MODEL_PATH = "Trained_Models/v2_11s.pt"
-MODEL_PATH   = "Trained_Models/v4_11s.pt"
+#MODEL_PATH   = "Trained_Models/v4_11s.pt"
+MODEL_PATH   = "Trained_Models/SusHi_sample.engine"
+
 YOLO_IMG_SIZE = 640
 CONF_THRESHOLD = 0.5
 
